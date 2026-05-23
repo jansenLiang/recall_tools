@@ -1,0 +1,459 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Mirako Recall Bridge</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body,
+      main,
+      video {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+      }
+
+      body {
+        overflow: hidden;
+        background: #050505;
+        color: #f8fafc;
+        font-family: Arial, Helvetica, sans-serif;
+      }
+
+      main {
+        position: relative;
+        display: grid;
+        place-items: center;
+      }
+
+      video {
+        display: block;
+        object-fit: contain;
+        background: #050505;
+      }
+
+      body.audio-only video {
+        display: none;
+      }
+
+      .fallback {
+        position: absolute;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        color: #94a3b8;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+
+      .status {
+        position: fixed;
+        left: 12px;
+        bottom: 12px;
+        max-width: min(720px, calc(100vw - 24px));
+        padding: 8px 10px;
+        border-radius: 6px;
+        background: rgba(0, 0, 0, 0.66);
+        color: #e2e8f0;
+        font-size: 12px;
+        line-height: 1.45;
+        white-space: pre-wrap;
+      }
+
+      .status.error {
+        background: rgba(127, 29, 29, 0.82);
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="fallback" id="fallback">Connecting Mirako</div>
+      <video id="remote-video" autoplay playsinline muted></video>
+      <audio id="remote-audio" autoplay></audio>
+    </main>
+    <div class="status" id="status">Starting bridge</div>
+
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.14.0/dist/ort.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.7/dist/bundle.min.js"></script>
+    <script>
+      const config = __BRIDGE_CONFIG__;
+      const mediaMode = config.mode === "audio" ? "audio-only" : "video-only";
+
+      const statusEl = document.getElementById("status");
+      const fallbackEl = document.getElementById("fallback");
+      const remoteVideo = document.getElementById("remote-video");
+      const remoteAudio = document.getElementById("remote-audio");
+
+      if (config.mode === "audio") {
+        document.body.classList.add("audio-only");
+        fallbackEl.textContent = "Mirako audio bridge";
+      }
+
+      const state = {
+        pc: null,
+        ws: null,
+        gatewaySessionId: null,
+        meetingAudioStream: null,
+        pendingLocalIceCandidates: [],
+        pendingRemoteIceCandidates: [],
+        vad: null,
+        vadTimer: null,
+        vadMode: null,
+        speaking: false,
+        reconnectAttempts: 0,
+        reconnectTimer: null,
+        cleaningUp: false,
+        stopped: false,
+      };
+
+      function setStatus(message, isError = false) {
+        statusEl.textContent = message;
+        statusEl.classList.toggle("error", isError);
+        console[isError ? "error" : "log"](`[bridge] ${message}`);
+      }
+
+      function toGatewayWsUrl(wsUrl, sessionId) {
+        if (wsUrl) {
+          const url = new URL(wsUrl);
+          url.pathname = url.pathname.replace(/\/+/g, "/");
+          return url.toString();
+        }
+        const url = new URL(config.gatewayUrl);
+        url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+        url.pathname = `${url.pathname.replace(/\/$/, "")}/ws/${encodeURIComponent(sessionId)}`;
+        url.pathname = url.pathname.replace(/\/+/g, "/");
+        url.search = "";
+        return url.toString();
+      }
+
+      async function postJson(path, body) {
+        const response = await fetch(`${config.gatewayUrl}${path}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!response.ok) {
+          throw new Error(`Gateway ${path} failed: HTTP ${response.status} ${await response.text()}`);
+        }
+        return response.json();
+      }
+
+      async function createGatewaySession() {
+        return postJson("/api/sessions", {
+          api_key: config.mirakoSessionId,
+          media_mode: mediaMode,
+        });
+      }
+
+      async function getMeetingAudioStream() {
+        return navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            sampleRate: 48000,
+            channelCount: 1,
+          },
+        });
+      }
+
+      function sendWs(message) {
+        if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+        state.ws.send(JSON.stringify(message));
+      }
+
+      function sendIceCandidate(candidate) {
+        const message = {
+          type: "ice-candidate",
+          candidate: candidate.candidate,
+          sdpMid: candidate.sdpMid,
+          sdpMLineIndex: candidate.sdpMLineIndex,
+          usernameFragment: candidate.usernameFragment,
+        };
+        if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+          state.pendingLocalIceCandidates.push(message);
+          return;
+        }
+        state.ws.send(JSON.stringify(message));
+      }
+
+      function flushLocalIceCandidates() {
+        if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+        const candidates = state.pendingLocalIceCandidates.splice(0);
+        for (const candidate of candidates) {
+          state.ws.send(JSON.stringify(candidate));
+        }
+      }
+
+      function setSpeaking(speaking) {
+        if (state.speaking === speaking) return;
+        state.speaking = speaking;
+        sendWs({ type: speaking ? "audio-start" : "audio-end", timestamp: Date.now() });
+      }
+
+      async function startSimpleVad(stream) {
+        const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+        if (!AudioContextCtor) {
+          setSpeaking(true);
+          return;
+        }
+
+        const audioContext = new AudioContextCtor({ sampleRate: 48000 });
+        const source = audioContext.createMediaStreamSource(stream);
+        const analyser = audioContext.createAnalyser();
+        analyser.fftSize = 1024;
+        source.connect(analyser);
+
+        const samples = new Uint8Array(analyser.fftSize);
+        let speechFrames = 0;
+        let silenceFrames = 0;
+
+        state.vad = { audioContext, source, analyser };
+        state.vadTimer = setInterval(() => {
+          analyser.getByteTimeDomainData(samples);
+          let sum = 0;
+          for (const sample of samples) {
+            const centered = sample - 128;
+            sum += centered * centered;
+          }
+          const rms = Math.sqrt(sum / samples.length);
+          if (rms > 6) {
+            speechFrames += 1;
+            silenceFrames = 0;
+          } else {
+            silenceFrames += 1;
+            speechFrames = 0;
+          }
+          if (!state.speaking && speechFrames >= 2) setSpeaking(true);
+          if (state.speaking && silenceFrames >= 12) setSpeaking(false);
+        }, 100);
+      }
+
+      async function startVad(stream) {
+        if (window.vad && window.vad.MicVAD) {
+          try {
+            state.vad = await window.vad.MicVAD.new({
+              onSpeechStart: () => setSpeaking(true),
+              onSpeechEnd: () => setSpeaking(false),
+              onVADMisfire: () => setSpeaking(false),
+            });
+            state.vad.start();
+            state.vadMode = "ricky0123/vad-web";
+            setStatus("VAD ready; waiting for media");
+            return;
+          } catch (error) {
+            console.warn("vad-web failed; falling back to simple VAD", error);
+          }
+        }
+
+        await startSimpleVad(stream);
+        state.vadMode = "simple-rms";
+      }
+
+      async function flushRemoteIceCandidates() {
+        const candidates = state.pendingRemoteIceCandidates.splice(0);
+        for (const candidate of candidates) {
+          try {
+            await state.pc.addIceCandidate(candidate);
+          } catch (error) {
+            console.warn("Failed to add queued ICE candidate", error);
+          }
+        }
+      }
+
+      function attachRemoteTrack(event) {
+        const stream = event.streams[0] || new MediaStream([event.track]);
+        if (event.track.kind === "video") {
+          if (remoteVideo.srcObject === stream) return;
+          fallbackEl.style.display = "none";
+          remoteVideo.srcObject = stream;
+          void remoteVideo.play().catch((error) => setStatus(`Video autoplay failed: ${error.message}`, true));
+          return;
+        }
+
+        if (event.track.kind === "audio") {
+          if (remoteAudio.srcObject === stream) return;
+          remoteAudio.srcObject = stream;
+          void remoteAudio.play().catch((error) => setStatus(`Audio autoplay failed: ${error.message}`, true));
+        }
+      }
+
+      async function connectWebRtc(setup) {
+        state.pc = new RTCPeerConnection({
+          iceServers: setup.ice_servers || [{ urls: "stun:stun.l.google.com:19302" }],
+        });
+
+        state.pc.ontrack = attachRemoteTrack;
+        state.pc.onconnectionstatechange = () => {
+          setStatus(`WebRTC ${state.pc.connectionState}`);
+          if (["failed", "disconnected"].includes(state.pc.connectionState)) {
+            scheduleReconnect();
+          }
+        };
+
+        state.pc.onicecandidate = (event) => {
+          if (!event.candidate) return;
+          sendIceCandidate(event.candidate);
+        };
+
+        state.meetingAudioStream = await getMeetingAudioStream();
+        for (const track of state.meetingAudioStream.getAudioTracks()) {
+          state.pc.addTrack(track, state.meetingAudioStream);
+        }
+
+        const hasServerOffer = Boolean(setup.sdp_offer);
+        let localAnswer = null;
+        if (hasServerOffer) {
+          await state.pc.setRemoteDescription({ type: "offer", sdp: setup.sdp_offer });
+          localAnswer = await state.pc.createAnswer();
+          await state.pc.setLocalDescription(localAnswer);
+        }
+
+        await new Promise((resolve, reject) => {
+          const ws = new WebSocket(toGatewayWsUrl(setup.ws_url, setup.session_id));
+          state.ws = ws;
+          const timeout = setTimeout(() => reject(new Error("Gateway WebSocket timeout")), 15000);
+
+          ws.onopen = () => {
+            clearTimeout(timeout);
+            if (hasServerOffer) {
+              ws.send(JSON.stringify({ type: "answer", sdp: localAnswer.sdp }));
+              flushLocalIceCandidates();
+              resolve();
+              return;
+            }
+
+            state.pc
+              .createOffer({
+                offerToReceiveVideo: mediaMode === "video-only",
+                offerToReceiveAudio: true,
+              })
+              .then((offer) => state.pc.setLocalDescription(offer).then(() => offer))
+              .then((offer) => {
+                ws.send(JSON.stringify({ type: "offer", sdp: offer.sdp }));
+                flushLocalIceCandidates();
+                resolve();
+              })
+              .catch(reject);
+          };
+
+          ws.onmessage = async (event) => {
+            const message = JSON.parse(event.data);
+            if (message.type === "answer") {
+              await state.pc.setRemoteDescription({ type: "answer", sdp: message.sdp });
+              await flushRemoteIceCandidates();
+              setStatus("WebRTC answer applied; waiting for media");
+              return;
+            }
+            if (message.type === "ice-candidate") {
+              const candidate = new RTCIceCandidate(message.candidate);
+              if (!state.pc.remoteDescription) {
+                state.pendingRemoteIceCandidates.push(candidate);
+                return;
+              }
+              try {
+                await state.pc.addIceCandidate(candidate);
+              } catch (error) {
+                console.warn("Failed to add remote ICE candidate", error);
+              }
+              return;
+            }
+            if (message.type === "answer-applied") {
+              await flushRemoteIceCandidates();
+              setStatus("WebRTC answer applied; waiting for media");
+            }
+          };
+
+          ws.onerror = () => reject(new Error("Gateway WebSocket error"));
+          ws.onclose = () => {
+            if (!state.cleaningUp) scheduleReconnect();
+          };
+        });
+
+        await startVad(state.meetingAudioStream);
+      }
+
+      async function stopGatewaySession() {
+        if (!state.gatewaySessionId) return;
+        try {
+          await fetch(`${config.gatewayUrl}/api/sessions/${encodeURIComponent(state.gatewaySessionId)}/stop`, {
+            method: "POST",
+          });
+        } catch (error) {
+          console.warn("Failed to stop gateway session", error);
+        }
+      }
+
+      function cleanup() {
+        state.cleaningUp = true;
+        if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
+        if (state.vadTimer) clearInterval(state.vadTimer);
+        if (state.vad && state.vad.audioContext) void state.vad.audioContext.close();
+        if (state.ws) {
+          state.ws.onclose = null;
+          state.ws.close();
+        }
+        if (state.pc) {
+          state.pc.onconnectionstatechange = null;
+          state.pc.close();
+        }
+        if (state.meetingAudioStream) {
+          for (const track of state.meetingAudioStream.getTracks()) track.stop();
+        }
+        state.ws = null;
+        state.pc = null;
+        state.meetingAudioStream = null;
+        state.pendingLocalIceCandidates = [];
+        state.pendingRemoteIceCandidates = [];
+        state.vad = null;
+        state.vadTimer = null;
+        state.vadMode = null;
+        state.speaking = false;
+        state.reconnectTimer = null;
+        state.cleaningUp = false;
+      }
+
+      function scheduleReconnect() {
+        if (state.stopped) return;
+        state.reconnectAttempts += 1;
+        if (state.reconnectAttempts > 5) {
+          setStatus("Bridge reconnect limit reached", true);
+          return;
+        }
+        const delay = Math.min(10000, 1000 * state.reconnectAttempts);
+        setStatus(`Bridge reconnecting in ${delay}ms`);
+        cleanup();
+        state.reconnectTimer = setTimeout(() => {
+          state.reconnectTimer = null;
+          start().catch((error) => setStatus(error.message, true));
+        }, delay);
+      }
+
+      async function start() {
+        setStatus(`Creating ${mediaMode} gateway session`);
+        const setup = await createGatewaySession();
+        state.gatewaySessionId = setup.session_id;
+        setStatus(`Gateway session ${setup.session_id}; connecting WebRTC`);
+        await connectWebRtc(setup);
+        state.reconnectAttempts = 0;
+        setTimeout(() => {
+          if (statusEl.classList.contains("error")) return;
+          statusEl.style.display = "none";
+        }, 12000);
+      }
+
+      window.addEventListener("beforeunload", () => {
+        state.stopped = true;
+        cleanup();
+        void stopGatewaySession();
+      });
+
+      start().catch((error) => setStatus(error.stack || error.message || String(error), true));
+    </script>
+  </body>
+</html>

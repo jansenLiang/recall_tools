@@ -16,10 +16,14 @@ class CreateSessionRequest(BaseModel):
         default="video",
         description="video: avatar video + audio into the meeting. audio: audio-only with a black placeholder page.",
     )
+    meeting_provider: Literal["zoom", "google_meet"] = Field(
+        default="zoom",
+        description="Meeting provider strategy. zoom is implemented; google_meet is reserved for the next strategy implementation.",
+    )
     meeting_url: str | None = Field(
         default=None,
         min_length=8,
-        description="Existing Zoom/Meet/Teams meeting URL. If omitted, the service creates a Zoom meeting.",
+        description="Existing meeting URL for meeting_provider. If omitted, the zoom strategy creates a Zoom meeting.",
     )
     public_base_url: str | None = Field(
         default=None,
@@ -39,6 +43,7 @@ class CreateSessionResponse(BaseModel):
     mirako_session_id: str
     bridge_url: str
     mode: Literal["video", "audio"]
+    meeting_provider: Literal["zoom", "google_meet"]
     created_meeting: dict[str, Any] | None = None
     recall_bot_id: str
     recall_bot: dict[str, Any]

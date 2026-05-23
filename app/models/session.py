@@ -11,6 +11,7 @@ class Session:
     mirako_session_id: str
     gateway_url: str
     mode: str
+    meeting_provider: str
     meeting_url: str
     bridge_url: str
     recall_bot_id: str

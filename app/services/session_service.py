@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import secrets
 import time
+import logging
 from typing import Any
 
 import httpx
 
 from app.clients.recall import RecallClient
-from app.clients.zoom import ZoomMeetingClient
 from app.core.config import Settings, settings
 from app.models.session import Session
 from app.schemas.sessions import CloseSessionResponse, CreateSessionRequest, CreateSessionResponse
+from app.services.meeting_strategies import get_meeting_strategy
+
+
+logger = logging.getLogger(__name__)
 
 
 class SessionServiceError(Exception):
@@ -39,10 +43,30 @@ class SessionService:
         created_meeting: dict[str, Any] | None = None
         meeting_url = req.meeting_url
         if not meeting_url:
-            created_meeting = await self._create_zoom_meeting(req)
+            logger.info(
+                "meeting_url omitted; creating meeting via provider=%s mirako_session_id=%s",
+                req.meeting_provider,
+                mirako_session_id,
+            )
+            created_meeting = await self._create_meeting(req)
             meeting_url = str(created_meeting.get("join_url") or "")
             if not meeting_url:
-                raise SessionServiceError(502, {"error": "zoom_join_url_missing", "zoom": created_meeting})
+                raise SessionServiceError(
+                    502,
+                    {"error": f"{req.meeting_provider}_join_url_missing", req.meeting_provider: created_meeting},
+                )
+            logger.info(
+                "meeting created provider=%s meeting_id=%s mirako_session_id=%s",
+                req.meeting_provider,
+                created_meeting.get("id"),
+                mirako_session_id,
+            )
+        else:
+            logger.info(
+                "using provided meeting_url provider=%s mirako_session_id=%s",
+                req.meeting_provider,
+                mirako_session_id,
+            )
 
         self.sessions[session_id] = Session(
             session_id=session_id,
@@ -50,6 +74,7 @@ class SessionService:
             mirako_session_id=mirako_session_id,
             gateway_url=gateway_url,
             mode=req.mode,
+            meeting_provider=req.meeting_provider,
             meeting_url=meeting_url,
             bridge_url=bridge_url,
             recall_bot_id="",
@@ -57,12 +82,21 @@ class SessionService:
             created_meeting=created_meeting,
             should_end_created_meeting=bool(created_meeting and req.end_created_meeting_on_close),
         )
+        logger.info(
+            "session stored session_id=%s mirako_session_id=%s provider=%s mode=%s bridge_url=%s",
+            session_id,
+            mirako_session_id,
+            req.meeting_provider,
+            req.mode,
+            bridge_url,
+        )
 
         try:
             bot = await self._create_recall_bot(req, meeting_url=meeting_url, bridge_url=bridge_url)
         except SessionServiceError:
             self.sessions.pop(session_id, None)
-            await self._best_effort_end_created_meeting(created_meeting)
+            await self._best_effort_end_created_meeting(req.meeting_provider, created_meeting)
+            logger.warning("session rolled back after recall bot creation failure session_id=%s", session_id)
             raise
 
         session = self.sessions[session_id]
@@ -70,7 +104,7 @@ class SessionService:
         session.recall_bot_id = str(bot.get("id") or bot.get("bot_id") or "")
         if not session.recall_bot_id:
             self.sessions.pop(session_id, None)
-            await self._best_effort_end_created_meeting(created_meeting)
+            await self._best_effort_end_created_meeting(req.meeting_provider, created_meeting)
             raise SessionServiceError(502, {"error": "recall_bot_id_missing", "bot": bot})
 
         return CreateSessionResponse(
@@ -79,6 +113,7 @@ class SessionService:
             mirako_session_id=mirako_session_id,
             bridge_url=bridge_url,
             mode=req.mode,
+            meeting_provider=req.meeting_provider,
             created_meeting=created_meeting,
             recall_bot_id=session.recall_bot_id,
             recall_bot=bot,
@@ -93,6 +128,7 @@ class SessionService:
         recall_left = False
         if session.recall_bot_id:
             try:
+                logger.info("leaving recall bot session_id=%s recall_bot_id=%s", session_id, session.recall_bot_id)
                 recall_response = await self._recall_client().leave_call(session.recall_bot_id)
                 recall_left = True
             except Exception as exc:
@@ -101,6 +137,12 @@ class SessionService:
         gateway_response = None
         gateway_stopped = False
         try:
+            logger.info(
+                "stopping gateway session_id=%s mirako_session_id=%s gateway_url=%s",
+                session_id,
+                session.mirako_session_id,
+                session.gateway_url,
+            )
             gateway_response = await self._stop_gateway_session(session)
             gateway_stopped = True
         except Exception as exc:
@@ -112,10 +154,16 @@ class SessionService:
             meeting_id = session.created_meeting.get("id")
             if meeting_id:
                 try:
-                    zoom_response = await self._zoom_client().end_meeting(meeting_id)
+                    logger.info(
+                        "ending provider-created meeting session_id=%s provider=%s meeting_id=%s",
+                        session_id,
+                        session.meeting_provider,
+                        meeting_id,
+                    )
+                    zoom_response = await self._meeting_strategy(session.meeting_provider).end_meeting(meeting_id)
                     zoom_ended = True
                 except Exception as exc:
-                    raise SessionServiceError(502, self._http_error_detail(exc, service="zoom"))
+                    raise SessionServiceError(502, self._http_error_detail(exc, service=session.meeting_provider))
 
         return CloseSessionResponse(
             session_id=session_id,
@@ -154,27 +202,30 @@ class SessionService:
             )
         return base
 
-    async def _create_zoom_meeting(self, req: CreateSessionRequest) -> dict[str, Any]:
-        topic = req.zoom_topic or self.settings.zoom_create_topic or "Mirako Recall Bridge"
-        duration = req.zoom_duration_minutes or self.settings.zoom_create_duration_minutes
-        try:
-            return await self._zoom_client().create_meeting(
+    async def _create_meeting(self, req: CreateSessionRequest) -> dict[str, Any]:
+        if req.meeting_provider == "google_meet":
+            raise SessionServiceError(
+                400,
                 {
-                    "topic": topic,
-                    "type": 1,
-                    "duration": duration,
-                    "settings": {
-                        "join_before_host": True,
-                        "waiting_room": False,
-                    },
+                    "error": "google_meet_strategy_not_implemented",
+                    "message": "meeting_provider=google_meet is reserved, but automatic Google Meet creation is not implemented yet. Provide meeting_url with meeting_provider=zoom, or implement the Google Meet strategy.",
                 },
-                user_id=self.settings.zoom_create_user_id or "me",
             )
+        try:
+            logger.info("creating meeting provider=%s", req.meeting_provider)
+            return await self._meeting_strategy(req.meeting_provider).create_meeting(req)
         except Exception as exc:
-            raise SessionServiceError(502, self._http_error_detail(exc, service="zoom"))
+            logger.exception("create meeting failed provider=%s", req.meeting_provider)
+            raise SessionServiceError(502, self._http_error_detail(exc, service=req.meeting_provider))
 
     async def _create_recall_bot(self, req: CreateSessionRequest, *, meeting_url: str, bridge_url: str) -> dict[str, Any]:
         try:
+            logger.info(
+                "creating recall bot provider=%s mode=%s bridge_url=%s",
+                req.meeting_provider,
+                req.mode,
+                bridge_url,
+            )
             return await self._recall_client().create_bot(
                 meeting_url=meeting_url,
                 bot_name=req.bot_name or self.settings.bot_name,
@@ -184,8 +235,10 @@ class SessionService:
                 metadata=req.metadata,
             )
         except httpx.HTTPStatusError as exc:
+            logger.exception("recall bot creation failed status_code=%s", exc.response.status_code)
             raise SessionServiceError(exc.response.status_code, self._http_error_detail(exc, service="recall"))
         except Exception as exc:
+            logger.exception("recall bot creation failed")
             raise SessionServiceError(502, self._http_error_detail(exc, service="recall"))
 
     async def _stop_gateway_session(self, session: Session) -> dict[str, Any] | None:
@@ -195,6 +248,7 @@ class SessionService:
                 headers={"Accept": "application/json"},
             )
             if response.status_code == 404:
+                logger.warning("gateway session not found mirako_session_id=%s", session.mirako_session_id)
                 return {"status_code": 404, "message": "Gateway session was already stopped or not found."}
             response.raise_for_status()
             if not response.content:
@@ -210,24 +264,20 @@ class SessionService:
         except Exception:
             pass
 
-    async def _best_effort_end_created_meeting(self, created_meeting: dict[str, Any] | None) -> None:
+    async def _best_effort_end_created_meeting(self, provider: str, created_meeting: dict[str, Any] | None) -> None:
         meeting_id = (created_meeting or {}).get("id")
         if not meeting_id:
             return
         try:
-            await self._zoom_client().end_meeting(meeting_id)
+            await self._meeting_strategy(provider).end_meeting(meeting_id)
         except Exception:
             pass
 
     def _recall_client(self) -> RecallClient:
         return RecallClient(api_key=self.settings.recall_api_key, base_url=self.settings.recall_base_url)
 
-    def _zoom_client(self) -> ZoomMeetingClient:
-        return ZoomMeetingClient(
-            client_id=self.settings.zoom_oauth_client_id,
-            client_secret=self.settings.zoom_oauth_client_secret,
-            account_id=self.settings.zoom_oauth_account_id,
-        )
+    def _meeting_strategy(self, provider: str):
+        return get_meeting_strategy(provider, self.settings)
 
     @staticmethod
     def _http_error_detail(exc: Exception, *, service: str) -> dict[str, Any]:

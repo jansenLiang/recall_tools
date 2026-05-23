@@ -73,7 +73,7 @@
   <body>
     <main>
       <div class="fallback" id="fallback">Connecting Mirako</div>
-      <video id="remote-video" autoplay playsinline muted></video>
+      <video id="remote-video" autoplay playsinline></video>
       <audio id="remote-audio" autoplay></audio>
     </main>
     <div class="status" id="status">Starting bridge</div>
@@ -99,6 +99,7 @@
         ws: null,
         gatewaySessionId: null,
         meetingAudioStream: null,
+        remoteMediaStream: new MediaStream(),
         pendingLocalIceCandidates: [],
         pendingRemoteIceCandidates: [],
         vad: null,
@@ -267,20 +268,27 @@
       }
 
       function attachRemoteTrack(event) {
-        const stream = event.streams[0] || new MediaStream([event.track]);
-        if (event.track.kind === "video") {
-          if (remoteVideo.srcObject === stream) return;
-          fallbackEl.style.display = "none";
-          remoteVideo.srcObject = stream;
-          void remoteVideo.play().catch((error) => setStatus(`Video autoplay failed: ${error.message}`, true));
+        if (config.mode === "audio") {
+          const stream = event.streams[0] || new MediaStream([event.track]);
+          if (event.track.kind === "audio" && remoteAudio.srcObject !== stream) {
+            remoteAudio.srcObject = stream;
+            void remoteAudio.play().catch((error) => setStatus(`Audio autoplay failed: ${error.message}`, true));
+          }
           return;
         }
 
-        if (event.track.kind === "audio") {
-          if (remoteAudio.srcObject === stream) return;
-          remoteAudio.srcObject = stream;
-          void remoteAudio.play().catch((error) => setStatus(`Audio autoplay failed: ${error.message}`, true));
+        if (!state.remoteMediaStream.getTracks().some((track) => track.id === event.track.id)) {
+          state.remoteMediaStream.addTrack(event.track);
         }
+
+        if (event.track.kind === "video") {
+          fallbackEl.style.display = "none";
+        }
+
+        if (remoteVideo.srcObject !== state.remoteMediaStream) {
+          remoteVideo.srcObject = state.remoteMediaStream;
+        }
+        void remoteVideo.play().catch((error) => setStatus(`Video autoplay failed: ${error.message}`, true));
       }
 
       async function connectWebRtc(setup) {
@@ -410,6 +418,7 @@
         state.meetingAudioStream = null;
         state.pendingLocalIceCandidates = [];
         state.pendingRemoteIceCandidates = [];
+        state.remoteMediaStream = new MediaStream();
         state.vad = null;
         state.vadTimer = null;
         state.vadMode = null;

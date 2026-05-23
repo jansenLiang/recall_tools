@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import httpx
+
+
+logger = logging.getLogger(__name__)
 
 
 class RecallClient:
@@ -22,6 +26,12 @@ class RecallClient:
         automatic_leave: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        logger.info(
+            "recall create_bot start meeting_url_provided=%s output_media=%s variant=%s",
+            bool(meeting_url),
+            output_media_url is not None,
+            variant,
+        )
         payload: dict[str, Any] = {
             "meeting_url": meeting_url,
             "bot_name": bot_name,
@@ -48,8 +58,12 @@ class RecallClient:
                 },
                 json=payload,
             )
+            if response.status_code >= 400:
+                logger.error("recall create_bot failed status_code=%s response=%s", response.status_code, response.text)
             response.raise_for_status()
-            return response.json()
+            data = response.json()
+            logger.info("recall create_bot success bot_id=%s", data.get("id") or data.get("bot_id"))
+            return data
 
     @staticmethod
     def _webpage_output_media(url: str) -> dict[str, Any]:
@@ -61,6 +75,7 @@ class RecallClient:
         }
 
     async def leave_call(self, bot_id: str) -> dict[str, Any] | None:
+        logger.info("recall leave_call start bot_id=%s", bot_id)
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(
                 f"{self.base_url}/bot/{bot_id}/leave_call/",
@@ -69,7 +84,12 @@ class RecallClient:
                     "Accept": "application/json",
                 },
             )
+            if response.status_code >= 400:
+                logger.error("recall leave_call failed bot_id=%s status_code=%s response=%s", bot_id, response.status_code, response.text)
             response.raise_for_status()
             if not response.content:
+                logger.info("recall leave_call success bot_id=%s empty_response=true", bot_id)
                 return None
-            return response.json()
+            data = response.json()
+            logger.info("recall leave_call success bot_id=%s", bot_id)
+            return data

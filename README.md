@@ -1,24 +1,78 @@
 # Mirako Recall Tools
 
-一个对接 Recall.ai 的小服务：传入 Mirako session id、会议链接和模式，Recall bot 会进会并把 `/bridge/{session_id}` 当作网页音视频输出。
+A small Recall.ai integration service. Given a Mirako session id, a meeting provider, an optional meeting URL, and a media mode, it creates a Recall bot that joins the meeting and opens `/bridge/{session_id}` as its webpage media output.
 
-## 结构
+## Role
+
+`recall_tools` does not join Zoom directly and does not generate the avatar. It creates the Recall.ai bot, serves the bridge page, passes the business session id to `live-stream-gateway`, and cleans up both the Recall bot and the gateway session when the session is closed.
+
+## Project Structure
 
 ```text
 app/
-  main.py                # FastAPI 装配入口
-  api/                   # 路由
-  clients/               # Recall / Zoom SDK 封装
-  core/                  # 配置和路径
-  models/                # 运行时数据结构
-  schemas/               # 请求响应模型
-  services/              # 会话编排
-static/bridge.html       # 给 Recall bot 打开的网页
+  main.py                # FastAPI entrypoint
+  api/                   # Routes
+  clients/               # Recall / Zoom client wrappers
+  core/                  # Config and paths
+  models/                # Runtime data structures
+  schemas/               # Request / response models
+  services/              # Session orchestration
+static/bridge.html       # Webpage opened by the Recall bot
 ```
 
-## 媒体链路
+## Media Flow
 
-video 模式:
+Overall architecture:
+
+```text
+Client / Backend
+  |  POST /api/sessions
+  |  x-api-key: SERVICE_API_KEY
+  v
+recall_tools (FastAPI)
+  |  Create Bot + output_media.camera.kind=webpage
+  v
+Recall.ai
+  |  bot joins meeting
+  |  bot browser opens PUBLIC_BASE_URL/bridge/{session_id}
+  v
+Zoom Meeting <-------------------------------+
+  | participant audio                         |
+  v                                           |
+Recall bot output-media browser              |
+  | getUserMedia({ audio: true })             |
+  | WebRTC audio track + VAD events           |
+  v                                           |
+live-stream-gateway                          |
+  | api_key = mirako_session_id               |
+  | talks to Mirako / Metis backend           |
+  | returns agent audio/video over WebRTC     |
+  v                                           |
+bridge.html playback ------------------------+
+  | Recall captures webpage media
+  v
+Zoom bot microphone/camera output
+```
+
+Control flow:
+
+```text
+POST /api/sessions
+  -> recall_tools validates x-api-key
+  -> recall_tools creates an in-memory session
+  -> recall_tools calls Recall.ai Create Bot
+  -> Recall.ai bot joins Zoom and opens bridge_url
+  -> bridge.html calls LIVE_STREAM_GATEWAY_URL/api/sessions
+  -> bridge.html connects LIVE_STREAM_GATEWAY_URL/ws/{mirako_session_id}
+
+POST /api/sessions/{session_id}/close
+  -> recall_tools validates x-api-key
+  -> Recall bot leave_call
+  -> live-stream-gateway stop session
+  -> optionally end Zoom meeting created by this service
+```
+
+Video mode:
 
 ```text
 Zoom participant audio
@@ -28,12 +82,12 @@ Zoom participant audio
 
 live-stream-gateway audio/video
   -> bridge WebRTC remote tracks
-  -> <audio>/<video> playback
+  -> single <video> playback for synchronized audio/video
   -> Recall output-media capture
   -> Zoom bot audio/camera
 ```
 
-audio 模式:
+Audio mode:
 
 ```text
 Zoom participant audio
@@ -49,10 +103,18 @@ live-stream-gateway audio only
 
 ## API
 
+Interactive API docs are available after starting the service:
+
+- Swagger UI: `http://localhost:8000/docs`
+- ReDoc: `http://localhost:8000/redoc`
+- OpenAPI JSON: `http://localhost:8000/openapi.json`
+
+Only the business APIs are included in the generated docs. `/bridge/{session_id}` is intentionally hidden from OpenAPI because it is opened directly by the Recall bot browser.
+
 - `POST /api/sessions`
 - `POST /api/sessions/{session_id}/close`
 
-### 创建
+### Create Session
 
 ```bash
 curl -X POST http://localhost:8000/api/sessions \
@@ -60,56 +122,127 @@ curl -X POST http://localhost:8000/api/sessions \
   -H 'x-api-key: your_service_api_key' \
   -d '{
     "mirako_session_id": "mirako-session-id",
+    "meeting_provider": "zoom",
     "meeting_url": "https://zoom.us/j/...",
     "mode": "video"
   }'
 ```
 
-`gateway_url` 不作为 API 参数传入，统一从环境变量 `LIVE_STREAM_GATEWAY_URL` 读取。`mirako_session_id` 会作为 live-stream-gateway 的 `api_key` 创建 session。
+`gateway_url` is not accepted as an API parameter. It is always read from the `LIVE_STREAM_GATEWAY_URL` environment variable. `mirako_session_id` is sent to `live-stream-gateway` as the gateway `api_key` and becomes the gateway session id.
 
-`mode` 取值：
+`mode` values:
 
-- `video`: 让 gateway 输出带画面的音视频，Recall bot 在 Zoom 里作为视频/音频输出。
-- `audio`: 只做纯语音进会，bridge 页面显示黑屏占位，不依赖视频输出。
+- `video`: the gateway sends audio and video into the meeting through the Recall bot.
+- `audio`: the gateway sends audio only; the bridge page shows a black placeholder and does not require video output.
 
-如果你只想做纯语音进会，`audio` 模式就是最轻的方案，不需要 GPU。
+`meeting_provider` values:
 
-不传 `meeting_url` 时会用 Zoom OAuth 配置创建一个会议，再让 Recall bot 加入。
+- `zoom`: implemented. If `meeting_url` is omitted, this service creates a Zoom meeting using the configured Zoom OAuth credentials.
+- `google_meet`: reserved for a future strategy implementation. Recall.ai supports Google Meet, but this service does not implement the Google Meet meeting strategy yet.
 
-### 关闭
+Use `audio` mode if you only need voice. It is the lightest mode and does not require a GPU.
+
+If `meeting_url` is provided, the service asks the Recall bot to join that existing meeting URL. If `meeting_url` is omitted with `meeting_provider: "zoom"`, the service creates a Zoom meeting and then asks the Recall bot to join it.
+
+### Close Session
 
 ```bash
 curl -X POST http://localhost:8000/api/sessions/$SESSION_ID/close \
   -H 'x-api-key: your_service_api_key'
 ```
 
-关闭时会同时：
+Closing a session performs these actions:
 
-- 让 Recall bot 离开会议。
-- 调用 `LIVE_STREAM_GATEWAY_URL/api/sessions/{mirako_session_id}/stop` 停掉 gateway session。
-- 如果是本服务创建的 Zoom meeting，则结束 Zoom meeting。
+- Ask the Recall bot to leave the meeting.
+- Call `LIVE_STREAM_GATEWAY_URL/api/sessions/{mirako_session_id}/stop` to stop the gateway session.
+- End the Zoom meeting if it was created by this service and `end_created_meeting_on_close` is enabled.
 
-## 本地跑
+## Local Development
+
+Create `.env`:
+
+```bash
+cp .env.example .env
+```
+
+Minimum required configuration:
+
+```env
+RECALL_API_KEY=your_recall_api_key
+RECALL_BASE_URL=https://ap-northeast-1.recall.ai/api/v1
+PUBLIC_BASE_URL=https://your-recall-tools-public-url.example.com
+LIVE_STREAM_GATEWAY_URL=https://your-live-stream-gateway-public-url.example.com
+SERVICE_API_KEY=your_service_api_key
+```
+
+`PUBLIC_BASE_URL` is the public HTTPS base URL that the Recall bot browser uses to open this service's bridge page. `LIVE_STREAM_GATEWAY_URL` is the public HTTPS base URL that the Recall bot browser uses to reach `live-stream-gateway`.
+
+Start `recall_tools`:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env
 python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-`../recall_demo/.env` 会被自动读取，所以你可以直接复用那边的 Recall / Zoom 配置。
+For development, use auto reload:
 
-## RunPod 跑
+```bash
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
 
-这个仓库已经带了 `Dockerfile`，适合直接做 RunPod Pod 镜像。
+For local testing, expose the service through a public HTTPS tunnel such as cloudflared, ngrok, or RunPod proxy, then set `PUBLIC_BASE_URL` to that public URL. Example:
 
-最省事的方式：
+```bash
+cloudflared tunnel --url http://localhost:8000
+```
 
-1. 用当前仓库构建镜像。
-2. 在 RunPod 里把容器端口设成 `8000`。
-3. 注入这些环境变量：
+Create a bot:
+
+```bash
+curl -X POST http://localhost:8000/api/sessions \
+  -H 'Content-Type: application/json' \
+  -H 'x-api-key: your_service_api_key' \
+  -d '{
+    "mirako_session_id": "dev",
+    "meeting_provider": "zoom",
+    "meeting_url": "https://zoom.us/j/...",
+    "mode": "video"
+  }'
+```
+
+To create a Zoom meeting automatically, omit `meeting_url`:
+
+```bash
+curl -X POST http://localhost:8000/api/sessions \
+  -H 'Content-Type: application/json' \
+  -H 'x-api-key: your_service_api_key' \
+  -d '{
+    "mirako_session_id": "dev",
+    "meeting_provider": "zoom",
+    "mode": "video"
+  }'
+```
+
+Close a bot:
+
+```bash
+curl -X POST http://localhost:8000/api/sessions/$SESSION_ID/close \
+  -H 'x-api-key: your_service_api_key'
+```
+
+`../recall_demo/.env` is also loaded automatically, so you can reuse Recall and Zoom configuration from that project when running locally.
+
+## RunPod Deployment
+
+This repository includes a `Dockerfile` and can be deployed as a RunPod Pod image.
+
+Recommended setup:
+
+1. Build an image from this repository.
+2. Set the container port to `8000` in RunPod.
+3. Inject these environment variables:
    - `RECALL_API_KEY`
    - `RECALL_BASE_URL`
    - `PUBLIC_BASE_URL`
@@ -118,26 +251,26 @@ python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
    - `ZOOM_OAUTH_CLIENT_ID`
    - `ZOOM_OAUTH_CLIENT_SECRET`
    - `ZOOM_OAUTH_ACCOUNT_ID`
-4. 启动命令保持默认：`python -m uvicorn app.main:app --host 0.0.0.0 --port 8000`
+4. Use the default start command: `python -m uvicorn app.main:app --host 0.0.0.0 --port 8000`
 
-如果你用的是 RunPod 提供的公开地址，就把它填到 `PUBLIC_BASE_URL`；如果你用 cloudflared/ngrok 等隧道，也直接把隧道 HTTPS 地址填到 `PUBLIC_BASE_URL`。
+If you use the public URL provided by RunPod, set it as `PUBLIC_BASE_URL`. If you use cloudflared, ngrok, or another tunnel, set `PUBLIC_BASE_URL` to that HTTPS tunnel URL instead.
 
-## Recall.ai 对接点
+## Recall.ai Integration Points
 
 - Create Bot: `POST /api/v1/bot/`
-- Output Media: `output_media` 参数随 Create Bot 一起传入
+- Output Media: the `output_media` parameter is sent in the Create Bot request
 - Leave Call: `POST /api/v1/bot/{id}/leave_call/`
 
-文档：
+Docs:
 
 - https://docs.recall.ai/reference/bot_create
 - https://docs.recall.ai/docs/stream-media
 - https://docs.recall.ai/v1.10/reference/bot_leave_call_create
 
-## 注意
+## Notes
 
-`LIVE_STREAM_GATEWAY_URL` 必须是 Recall bot 浏览器可以访问的公网 HTTPS API 根地址，且 gateway 返回的 `ws_url` 也必须是公网可访问的 `wss://` 地址。
+`LIVE_STREAM_GATEWAY_URL` must be a public HTTPS API base URL reachable from the Recall bot browser. The `ws_url` returned by the gateway must also be publicly reachable over `wss://`.
 
-`SERVICE_API_KEY` 用于保护业务 API。设置后，`POST /api/sessions` 和 `POST /api/sessions/{session_id}/close` 必须带 `x-api-key` header；`/bridge/{session_id}` 不校验该 header，因为 Recall bot 需要直接打开这个网页。
+`SERVICE_API_KEY` protects the business API. When it is set, `POST /api/sessions` and `POST /api/sessions/{session_id}/close` must include the `x-api-key` header. `/bridge/{session_id}` does not require this header because the Recall bot needs to open it directly.
 
-Bridge 页面优先使用 `@ricky0123/vad-web` 发送 gateway 需要的 `audio-start` / `audio-end` 事件；如果 CDN 或模型加载失败，会自动回退到简单 RMS VAD。
+The bridge page first tries to use `@ricky0123/vad-web` to send the gateway's required `audio-start` and `audio-end` events. If the CDN or model loading fails, it falls back to a simple RMS-based VAD.

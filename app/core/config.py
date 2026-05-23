@@ -46,6 +46,7 @@ class Settings:
 
         self.app_host = env("APP_HOST", "0.0.0.0")
         self.app_port = env_int("APP_PORT", 8000)
+        self.log_level = env("LOG_LEVEL", "INFO")
         self.bot_name = env("BOT_NAME", "Mirako Recall Bridge")
         self.recall_bot_variant = env("RECALL_BOT_VARIANT", "web_4_core")
 

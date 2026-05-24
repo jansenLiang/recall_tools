@@ -80,7 +80,7 @@ class SessionService:
             recall_bot_id="",
             recall_bot={},
             created_meeting=created_meeting,
-            should_end_created_meeting=bool(created_meeting and req.end_created_meeting_on_close),
+            should_end_created_meeting=bool(created_meeting),
         )
         logger.info(
             "session stored session_id=%s mirako_session_id=%s provider=%s mode=%s bridge_url=%s",
@@ -231,8 +231,6 @@ class SessionService:
                 bot_name=req.bot_name or self.settings.bot_name,
                 variant=self.settings.recall_bot_variant,
                 output_media_url=bridge_url,
-                automatic_leave=req.automatic_leave,
-                metadata=req.metadata,
             )
         except httpx.HTTPStatusError as exc:
             logger.exception("recall bot creation failed status_code=%s", exc.response.status_code)

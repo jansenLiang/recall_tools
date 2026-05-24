@@ -23,8 +23,6 @@ class RecallClient:
         bot_name: str,
         variant: str,
         output_media_url: str | None = None,
-        automatic_leave: dict[str, Any] | None = None,
-        metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         logger.info(
             "recall create_bot start meeting_url_provided=%s output_media=%s variant=%s",
@@ -43,10 +41,6 @@ class RecallClient:
         }
         if output_media_url is not None:
             payload["output_media"] = self._webpage_output_media(output_media_url)
-        if automatic_leave is not None:
-            payload["automatic_leave"] = automatic_leave
-        if metadata is not None:
-            payload["metadata"] = metadata
 
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(

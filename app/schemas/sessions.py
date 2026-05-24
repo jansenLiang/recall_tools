@@ -32,9 +32,6 @@ class CreateSessionRequest(BaseModel):
     bot_name: str | None = Field(default=None, min_length=1, max_length=100)
     zoom_topic: str | None = None
     zoom_duration_minutes: int | None = Field(default=None, ge=1, le=1440)
-    end_created_meeting_on_close: bool = True
-    automatic_leave: dict[str, Any] | None = None
-    metadata: dict[str, Any] | None = None
 
 
 class CreateSessionResponse(BaseModel):
@@ -57,3 +54,15 @@ class CloseSessionResponse(BaseModel):
     gateway_response: dict[str, Any] | None = None
     zoom_ended: bool = False
     zoom_response: dict[str, Any] | None = None
+
+
+class BridgeTelemetryRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    event: str = Field(min_length=1, max_length=100)
+    session_id: str = Field(min_length=1)
+    gateway_session_id: str | None = None
+    mirako_session_id: str | None = None
+    mode: str | None = None
+    elapsed_ms: int | None = None
+    payload: dict[str, Any] | None = None

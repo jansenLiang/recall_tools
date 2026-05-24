@@ -104,7 +104,11 @@
         pendingRemoteIceCandidates: [],
         vad: null,
         vadTimer: null,
+        vadEndTimer: null,
         vadMode: null,
+        speakingStartedAt: 0,
+        startedAt: Date.now(),
+        trackCounts: { audio: 0, video: 0 },
         speaking: false,
         reconnectAttempts: 0,
         reconnectTimer: null,
@@ -116,6 +120,80 @@
         statusEl.textContent = message;
         statusEl.classList.toggle("error", isError);
         console[isError ? "error" : "log"](`[bridge] ${message}`);
+        sendTelemetry("status", { message, isError });
+      }
+
+      function safeError(error) {
+        if (!error) return null;
+        return {
+          name: error.name || null,
+          message: error.message || String(error),
+          stack: error.stack || null,
+        };
+      }
+
+      function sendTelemetry(event, payload = {}) {
+        const body = {
+          event,
+          session_id: config.sessionId,
+          gateway_session_id: state.gatewaySessionId,
+          mirako_session_id: config.mirakoSessionId,
+          mode: config.mode,
+          elapsed_ms: Date.now() - state.startedAt,
+          payload,
+        };
+        const data = JSON.stringify(body);
+        try {
+          if (navigator.sendBeacon) {
+            const blob = new Blob([data], { type: "application/json" });
+            if (navigator.sendBeacon("/api/bridge-telemetry", blob)) return;
+          }
+          void fetch("/api/bridge-telemetry", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: data,
+            keepalive: true,
+          }).catch(() => {});
+        } catch (_) {}
+      }
+
+      function summarizeTrack(track) {
+        if (!track) return null;
+        let settings = {};
+        try {
+          settings = track.getSettings ? track.getSettings() : {};
+        } catch (_) {}
+        return {
+          id: track.id,
+          kind: track.kind,
+          label: track.label,
+          enabled: track.enabled,
+          muted: track.muted,
+          readyState: track.readyState,
+          settings,
+        };
+      }
+
+      function collectMediaElementState() {
+        return {
+          video: {
+            videoWidth: remoteVideo.videoWidth,
+            videoHeight: remoteVideo.videoHeight,
+            readyState: remoteVideo.readyState,
+            networkState: remoteVideo.networkState,
+            paused: remoteVideo.paused,
+            muted: remoteVideo.muted,
+            currentTime: Number(remoteVideo.currentTime.toFixed(3)),
+            playbackRate: remoteVideo.playbackRate,
+            tracks: state.remoteMediaStream.getTracks().map(summarizeTrack),
+          },
+          audio: {
+            readyState: remoteAudio.readyState,
+            networkState: remoteAudio.networkState,
+            paused: remoteAudio.paused,
+            currentTime: Number(remoteAudio.currentTime.toFixed(3)),
+          },
+        };
       }
 
       function toGatewayWsUrl(wsUrl, sessionId) {
@@ -145,10 +223,18 @@
       }
 
       async function createGatewaySession() {
-        return postJson("/api/sessions", {
+        sendTelemetry("gateway-session-create-start", { gatewayUrl: config.gatewayUrl, mediaMode });
+        const setup = await postJson("/api/sessions", {
           api_key: config.mirakoSessionId,
           media_mode: mediaMode,
         });
+        sendTelemetry("gateway-session-create-success", {
+          sessionId: setup.session_id,
+          hasSdpOffer: Boolean(setup.sdp_offer),
+          hasWsUrl: Boolean(setup.ws_url),
+          iceServers: setup.ice_servers,
+        });
+        return setup;
       }
 
       async function getMeetingAudioStream() {
@@ -194,7 +280,36 @@
       function setSpeaking(speaking) {
         if (state.speaking === speaking) return;
         state.speaking = speaking;
+        if (speaking) state.speakingStartedAt = Date.now();
         sendWs({ type: speaking ? "audio-start" : "audio-end", timestamp: Date.now() });
+        sendTelemetry("vad-speaking", { speaking, vadMode: state.vadMode });
+      }
+
+      function requestSpeaking(speaking) {
+        if (speaking) {
+          if (state.vadEndTimer) {
+            clearTimeout(state.vadEndTimer);
+            state.vadEndTimer = null;
+          }
+          setSpeaking(true);
+          return;
+        }
+
+        if (state.vadEndTimer) return;
+        state.vadEndTimer = setTimeout(() => {
+          state.vadEndTimer = null;
+          setSpeaking(false);
+        }, 1500);
+      }
+
+      function startSpeechWatchdog() {
+        setInterval(() => {
+          if (!state.speaking || !state.speakingStartedAt) return;
+          if (Date.now() - state.speakingStartedAt > 15000) {
+            sendTelemetry("vad-watchdog-audio-end", { speakingForMs: Date.now() - state.speakingStartedAt });
+            setSpeaking(false);
+          }
+        }, 1000);
       }
 
       async function startSimpleVad(stream) {
@@ -230,8 +345,8 @@
             silenceFrames += 1;
             speechFrames = 0;
           }
-          if (!state.speaking && speechFrames >= 2) setSpeaking(true);
-          if (state.speaking && silenceFrames >= 12) setSpeaking(false);
+          if (!state.speaking && speechFrames >= 3) requestSpeaking(true);
+          if (state.speaking && silenceFrames >= 20) requestSpeaking(false);
         }, 100);
       }
 
@@ -239,21 +354,29 @@
         if (window.vad && window.vad.MicVAD) {
           try {
             state.vad = await window.vad.MicVAD.new({
-              onSpeechStart: () => setSpeaking(true),
-              onSpeechEnd: () => setSpeaking(false),
-              onVADMisfire: () => setSpeaking(false),
+              positiveSpeechThreshold: 0.6,
+              negativeSpeechThreshold: 0.35,
+              redemptionFrames: 16,
+              preSpeechPadFrames: 5,
+              minSpeechFrames: 3,
+              onSpeechStart: () => requestSpeaking(true),
+              onSpeechEnd: () => requestSpeaking(false),
+              onVADMisfire: () => requestSpeaking(false),
             });
             state.vad.start();
             state.vadMode = "ricky0123/vad-web";
             setStatus("VAD ready; waiting for media");
+            sendTelemetry("vad-ready", { mode: state.vadMode });
             return;
           } catch (error) {
             console.warn("vad-web failed; falling back to simple VAD", error);
+            sendTelemetry("vad-web-failed", { error: safeError(error) });
           }
         }
 
         await startSimpleVad(stream);
         state.vadMode = "simple-rms";
+        sendTelemetry("vad-ready", { mode: state.vadMode });
       }
 
       async function flushRemoteIceCandidates() {
@@ -268,11 +391,25 @@
       }
 
       function attachRemoteTrack(event) {
+        state.trackCounts[event.track.kind] = (state.trackCounts[event.track.kind] || 0) + 1;
+        sendTelemetry("remote-track", {
+          track: summarizeTrack(event.track),
+          streamIds: event.streams.map((stream) => stream.id),
+          trackCounts: state.trackCounts,
+        });
+
+        event.track.onmute = () => sendTelemetry("remote-track-mute", { track: summarizeTrack(event.track) });
+        event.track.onunmute = () => sendTelemetry("remote-track-unmute", { track: summarizeTrack(event.track) });
+        event.track.onended = () => sendTelemetry("remote-track-ended", { track: summarizeTrack(event.track) });
+
         if (config.mode === "audio") {
           const stream = event.streams[0] || new MediaStream([event.track]);
           if (event.track.kind === "audio" && remoteAudio.srcObject !== stream) {
             remoteAudio.srcObject = stream;
-            void remoteAudio.play().catch((error) => setStatus(`Audio autoplay failed: ${error.message}`, true));
+            void remoteAudio.play().catch((error) => {
+              sendTelemetry("audio-play-failed", { error: safeError(error), media: collectMediaElementState() });
+              setStatus(`Audio autoplay failed: ${error.message}`, true);
+            });
           }
           return;
         }
@@ -288,28 +425,54 @@
         if (remoteVideo.srcObject !== state.remoteMediaStream) {
           remoteVideo.srcObject = state.remoteMediaStream;
         }
-        void remoteVideo.play().catch((error) => setStatus(`Video autoplay failed: ${error.message}`, true));
+        void remoteVideo.play().catch((error) => {
+          sendTelemetry("video-play-failed", { error: safeError(error), media: collectMediaElementState() });
+          setStatus(`Video autoplay failed: ${error.message}`, true);
+        });
       }
 
       async function connectWebRtc(setup) {
         state.pc = new RTCPeerConnection({
           iceServers: setup.ice_servers || [{ urls: "stun:stun.l.google.com:19302" }],
         });
+        sendTelemetry("webrtc-peer-created", { iceServers: setup.ice_servers || null });
 
         state.pc.ontrack = attachRemoteTrack;
         state.pc.onconnectionstatechange = () => {
           setStatus(`WebRTC ${state.pc.connectionState}`);
+          sendTelemetry("webrtc-connection-state", { connectionState: state.pc.connectionState });
           if (["failed", "disconnected"].includes(state.pc.connectionState)) {
             scheduleReconnect();
           }
         };
+        state.pc.oniceconnectionstatechange = () => {
+          sendTelemetry("webrtc-ice-state", { iceConnectionState: state.pc.iceConnectionState });
+        };
+        state.pc.onicegatheringstatechange = () => {
+          sendTelemetry("webrtc-ice-gathering-state", { iceGatheringState: state.pc.iceGatheringState });
+        };
+        state.pc.onsignalingstatechange = () => {
+          sendTelemetry("webrtc-signaling-state", { signalingState: state.pc.signalingState });
+        };
 
         state.pc.onicecandidate = (event) => {
-          if (!event.candidate) return;
+          if (!event.candidate) {
+            sendTelemetry("local-ice-complete");
+            return;
+          }
+          sendTelemetry("local-ice-candidate", {
+            candidateType: event.candidate.type,
+            protocol: event.candidate.protocol,
+            address: event.candidate.address,
+            port: event.candidate.port,
+          });
           sendIceCandidate(event.candidate);
         };
 
         state.meetingAudioStream = await getMeetingAudioStream();
+        sendTelemetry("meeting-audio-stream", {
+          tracks: state.meetingAudioStream.getTracks().map(summarizeTrack),
+        });
         for (const track of state.meetingAudioStream.getAudioTracks()) {
           state.pc.addTrack(track, state.meetingAudioStream);
         }
@@ -326,9 +489,11 @@
           const ws = new WebSocket(toGatewayWsUrl(setup.ws_url, setup.session_id));
           state.ws = ws;
           const timeout = setTimeout(() => reject(new Error("Gateway WebSocket timeout")), 15000);
+          sendTelemetry("gateway-ws-connecting", { wsUrl: toGatewayWsUrl(setup.ws_url, setup.session_id) });
 
           ws.onopen = () => {
             clearTimeout(timeout);
+            sendTelemetry("gateway-ws-open");
             if (hasServerOffer) {
               ws.send(JSON.stringify({ type: "answer", sdp: localAnswer.sdp }));
               flushLocalIceCandidates();
@@ -352,6 +517,7 @@
 
           ws.onmessage = async (event) => {
             const message = JSON.parse(event.data);
+            sendTelemetry("gateway-ws-message", { type: message.type });
             if (message.type === "answer") {
               await state.pc.setRemoteDescription({ type: "answer", sdp: message.sdp });
               await flushRemoteIceCandidates();
@@ -377,13 +543,18 @@
             }
           };
 
-          ws.onerror = () => reject(new Error("Gateway WebSocket error"));
-          ws.onclose = () => {
+          ws.onerror = (event) => {
+            sendTelemetry("gateway-ws-error", { readyState: ws.readyState, eventType: event.type });
+            reject(new Error("Gateway WebSocket error"));
+          };
+          ws.onclose = (event) => {
+            sendTelemetry("gateway-ws-close", { code: event.code, reason: event.reason, wasClean: event.wasClean });
             if (!state.cleaningUp) scheduleReconnect();
           };
         });
 
         await startVad(state.meetingAudioStream);
+        startSpeechWatchdog();
       }
 
       async function stopGatewaySession() {
@@ -401,6 +572,7 @@
         state.cleaningUp = true;
         if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
         if (state.vadTimer) clearInterval(state.vadTimer);
+        if (state.vadEndTimer) clearTimeout(state.vadEndTimer);
         if (state.vad && state.vad.audioContext) void state.vad.audioContext.close();
         if (state.ws) {
           state.ws.onclose = null;
@@ -421,6 +593,8 @@
         state.remoteMediaStream = new MediaStream();
         state.vad = null;
         state.vadTimer = null;
+        state.vadEndTimer = null;
+        state.trackCounts = { audio: 0, video: 0 };
         state.vadMode = null;
         state.speaking = false;
         state.reconnectTimer = null;
@@ -444,6 +618,11 @@
       }
 
       async function start() {
+        sendTelemetry("bridge-start", {
+          userAgent: navigator.userAgent,
+          location: window.location.href,
+          viewport: { width: window.innerWidth, height: window.innerHeight, devicePixelRatio: window.devicePixelRatio },
+        });
         setStatus(`Creating ${mediaMode} gateway session`);
         const setup = await createGatewaySession();
         state.gatewaySessionId = setup.session_id;
@@ -457,9 +636,39 @@
       }
 
       window.addEventListener("beforeunload", () => {
+        sendTelemetry("bridge-beforeunload", { media: collectMediaElementState() });
         state.stopped = true;
         cleanup();
         void stopGatewaySession();
+      });
+
+      window.addEventListener("error", (event) => {
+        sendTelemetry("window-error", {
+          message: event.message,
+          filename: event.filename,
+          lineno: event.lineno,
+          colno: event.colno,
+          error: safeError(event.error),
+        });
+      });
+
+      window.addEventListener("unhandledrejection", (event) => {
+        sendTelemetry("unhandled-rejection", { reason: safeError(event.reason) || String(event.reason) });
+      });
+
+      remoteVideo.addEventListener("loadedmetadata", () => sendTelemetry("video-loadedmetadata", { media: collectMediaElementState() }));
+      remoteVideo.addEventListener("loadeddata", () => sendTelemetry("video-loadeddata", { media: collectMediaElementState() }));
+      remoteVideo.addEventListener("canplay", () => sendTelemetry("video-canplay", { media: collectMediaElementState() }));
+      remoteVideo.addEventListener("playing", () => sendTelemetry("video-playing", { media: collectMediaElementState() }));
+      remoteVideo.addEventListener("waiting", () => sendTelemetry("video-waiting", { media: collectMediaElementState() }));
+      remoteVideo.addEventListener("stalled", () => sendTelemetry("video-stalled", { media: collectMediaElementState() }));
+      remoteVideo.addEventListener("resize", () => sendTelemetry("video-resize", { media: collectMediaElementState() }));
+      remoteVideo.addEventListener("error", () => {
+        const error = remoteVideo.error;
+        sendTelemetry("video-element-error", {
+          error: error ? { code: error.code, message: error.message } : null,
+          media: collectMediaElementState(),
+        });
       });
 
       start().catch((error) => setStatus(error.stack || error.message || String(error), true));

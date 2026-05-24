@@ -155,7 +155,7 @@ Closing a session performs these actions:
 
 - Ask the Recall bot to leave the meeting.
 - Call `LIVE_STREAM_GATEWAY_URL/api/sessions/{mirako_session_id}/stop` to stop the gateway session.
-- End the Zoom meeting if it was created by this service and `end_created_meeting_on_close` is enabled.
+- End the Zoom meeting if it was created by this service.
 
 ## Local Development
 

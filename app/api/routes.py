@@ -9,12 +9,13 @@ from fastapi.responses import HTMLResponse
 
 from app.core.config import settings
 from app.core.paths import STATIC_DIR
-from app.schemas.sessions import CloseSessionResponse, CreateSessionRequest, CreateSessionResponse
+from app.schemas.sessions import BridgeTelemetryRequest, CloseSessionResponse, CreateSessionRequest, CreateSessionResponse
 from app.services.session_service import SessionServiceError, session_service
 
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+bridge_logger = logging.getLogger("bridge.telemetry")
 
 
 def verify_api_key(x_api_key: str | None = Header(default=None)) -> None:
@@ -101,6 +102,24 @@ async def close_session(
     except SessionServiceError as exc:
         logger.error("close_session failed session_id=%s status_code=%s detail=%s", session_id, exc.status_code, exc.detail)
         raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+
+
+@router.post("/api/bridge-telemetry", include_in_schema=False)
+async def bridge_telemetry(req: BridgeTelemetryRequest) -> dict[str, bool]:
+    session = session_service.get_session(req.session_id)
+    known_session = session is not None
+    bridge_logger.info(
+        "event=%s session_id=%s known_session=%s gateway_session_id=%s mirako_session_id=%s mode=%s elapsed_ms=%s payload=%s",
+        req.event,
+        req.session_id,
+        known_session,
+        req.gateway_session_id,
+        req.mirako_session_id,
+        req.mode,
+        req.elapsed_ms,
+        json.dumps(req.payload or {}, ensure_ascii=True, sort_keys=True),
+    )
+    return {"ok": True}
 
 
 @router.get("/bridge/{session_id}", response_class=HTMLResponse, include_in_schema=False)

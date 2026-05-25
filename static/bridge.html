@@ -106,12 +106,19 @@
         vadTimer: null,
         vadEndTimer: null,
         vadMode: null,
+        vadSeq: 0,
+        vadPendingStart: null,
+        vadStartTimer: null,
+        vadAudioContext: null,
+        vadAnalyser: null,
         speakingStartedAt: 0,
+        speakingSeq: null,
         startedAt: Date.now(),
         trackCounts: { audio: 0, video: 0 },
         speaking: false,
         reconnectAttempts: 0,
         reconnectTimer: null,
+        speechWatchdogTimer: null,
         cleaningUp: false,
         stopped: false,
       };
@@ -254,6 +261,50 @@
         state.ws.send(JSON.stringify(message));
       }
 
+      const vadGate = {
+        startDelayMs: 80,
+        endHangoverMs: 300,
+        minStartRms: 0.02,
+        minStartPeak: 0.08,
+        watchdogMs: 15000,
+      };
+
+      function clearVadStartTimer() {
+        if (state.vadStartTimer) {
+          clearTimeout(state.vadStartTimer);
+          state.vadStartTimer = null;
+        }
+        state.vadPendingStart = null;
+      }
+
+      function currentAudioMetrics() {
+        const analyser = state.vadAnalyser;
+        if (!analyser) return { rms: 0, peak: 0 };
+        const samples = new Float32Array(analyser.fftSize);
+        analyser.getFloatTimeDomainData(samples);
+        let sumSquares = 0;
+        let peak = 0;
+        for (const sample of samples) {
+          const value = Math.abs(sample || 0);
+          sumSquares += value * value;
+          if (value > peak) peak = value;
+        }
+        return { rms: Math.sqrt(sumSquares / samples.length), peak };
+      }
+
+      function attachVadAnalyser(stream) {
+        try {
+          const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+          if (!AudioContextCtor) return;
+          state.vadAudioContext = new AudioContextCtor({ sampleRate: 48000 });
+          state.vadAnalyser = state.vadAudioContext.createAnalyser();
+          state.vadAnalyser.fftSize = 2048;
+          state.vadAudioContext.createMediaStreamSource(stream).connect(state.vadAnalyser);
+        } catch (error) {
+          sendTelemetry("vad-analyser-failed", { error: safeError(error) });
+        }
+      }
+
       function sendIceCandidate(candidate) {
         const message = {
           type: "ice-candidate",
@@ -277,37 +328,105 @@
         }
       }
 
-      function setSpeaking(speaking) {
+      function setSpeaking(speaking, detail = {}) {
         if (state.speaking === speaking) return;
         state.speaking = speaking;
-        if (speaking) state.speakingStartedAt = Date.now();
-        sendWs({ type: speaking ? "audio-start" : "audio-end", timestamp: Date.now() });
-        sendTelemetry("vad-speaking", { speaking, vadMode: state.vadMode });
+        const timestamp = Date.now();
+        if (speaking) {
+          state.speakingStartedAt = timestamp;
+          state.speakingSeq = detail.seq || ++state.vadSeq;
+        }
+        const durationMs = speaking ? 0 : timestamp - state.speakingStartedAt;
+        const message = {
+          type: speaking ? "audio-start" : "audio-end",
+          timestamp,
+          seq: state.speakingSeq,
+          duration_ms: durationMs,
+          rms: detail.rms,
+          peak: detail.peak,
+          reason: detail.reason || (speaking ? "vad-start" : "vad-end"),
+        };
+        sendWs(message);
+        sendTelemetry("vad-speaking", {
+          speaking,
+          vadMode: state.vadMode,
+          seq: message.seq,
+          duration_ms: durationMs,
+          rms: detail.rms,
+          peak: detail.peak,
+          reason: message.reason,
+        });
+        if (!speaking) {
+          state.speakingSeq = null;
+          state.speakingStartedAt = 0;
+        }
       }
 
-      function requestSpeaking(speaking) {
+      function requestSpeaking(speaking, detail = {}) {
         if (speaking) {
           if (state.vadEndTimer) {
             clearTimeout(state.vadEndTimer);
             state.vadEndTimer = null;
           }
-          setSpeaking(true);
+          setSpeaking(true, detail);
           return;
         }
 
         if (state.vadEndTimer) return;
         state.vadEndTimer = setTimeout(() => {
           state.vadEndTimer = null;
-          setSpeaking(false);
-        }, 1500);
+          setSpeaking(false, detail);
+        }, vadGate.endHangoverMs);
+      }
+
+      function requestVadStart() {
+        if (state.speaking || state.vadPendingStart) return;
+        const seq = ++state.vadSeq;
+        const startedAt = Date.now();
+        const initialMetrics = currentAudioMetrics();
+        state.vadPendingStart = { seq, startedAt, initialMetrics };
+        state.vadStartTimer = setTimeout(() => {
+          const pending = state.vadPendingStart;
+          if (!pending) return;
+          const delayedMetrics = currentAudioMetrics();
+          const rms = Math.max(pending.initialMetrics.rms, delayedMetrics.rms);
+          const peak = Math.max(pending.initialMetrics.peak, delayedMetrics.peak);
+          clearVadStartTimer();
+          if (rms < vadGate.minStartRms || peak < vadGate.minStartPeak) {
+            sendTelemetry("vad-start-rejected", {
+              seq,
+              reason: "low-energy",
+              duration_ms: Date.now() - startedAt,
+              rms,
+              peak,
+            });
+            return;
+          }
+          requestSpeaking(true, { seq, rms, peak, reason: "delayed-vad-start" });
+        }, vadGate.startDelayMs);
+      }
+
+      function requestVadEnd(reason = "vad-end") {
+        clearVadStartTimer();
+        requestSpeaking(false, { reason, ...currentAudioMetrics() });
+      }
+
+      function forceVadEnd(reason) {
+        clearVadStartTimer();
+        if (state.vadEndTimer) {
+          clearTimeout(state.vadEndTimer);
+          state.vadEndTimer = null;
+        }
+        if (state.speaking) setSpeaking(false, { reason, ...currentAudioMetrics() });
       }
 
       function startSpeechWatchdog() {
-        setInterval(() => {
+        if (state.speechWatchdogTimer) clearInterval(state.speechWatchdogTimer);
+        state.speechWatchdogTimer = setInterval(() => {
           if (!state.speaking || !state.speakingStartedAt) return;
-          if (Date.now() - state.speakingStartedAt > 15000) {
+          if (Date.now() - state.speakingStartedAt > vadGate.watchdogMs) {
             sendTelemetry("vad-watchdog-audio-end", { speakingForMs: Date.now() - state.speakingStartedAt });
-            setSpeaking(false);
+            forceVadEnd("vad-watchdog");
           }
         }, 1000);
       }
@@ -345,8 +464,8 @@
             silenceFrames += 1;
             speechFrames = 0;
           }
-          if (!state.speaking && speechFrames >= 3) requestSpeaking(true);
-          if (state.speaking && silenceFrames >= 20) requestSpeaking(false);
+          if (!state.speaking && speechFrames >= 3) requestVadStart();
+          if (state.speaking && silenceFrames >= 20) requestVadEnd("simple-vad-end");
         }, 100);
       }
 
@@ -359,9 +478,9 @@
               redemptionFrames: 16,
               preSpeechPadFrames: 5,
               minSpeechFrames: 3,
-              onSpeechStart: () => requestSpeaking(true),
-              onSpeechEnd: () => requestSpeaking(false),
-              onVADMisfire: () => requestSpeaking(false),
+              onSpeechStart: requestVadStart,
+              onSpeechEnd: () => requestVadEnd("vad-end"),
+              onVADMisfire: () => forceVadEnd("vad-misfire"),
             });
             state.vad.start();
             state.vadMode = "ricky0123/vad-web";
@@ -470,6 +589,7 @@
         };
 
         state.meetingAudioStream = await getMeetingAudioStream();
+        attachVadAnalyser(state.meetingAudioStream);
         sendTelemetry("meeting-audio-stream", {
           tracks: state.meetingAudioStream.getTracks().map(summarizeTrack),
         });
@@ -573,7 +693,10 @@
         if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
         if (state.vadTimer) clearInterval(state.vadTimer);
         if (state.vadEndTimer) clearTimeout(state.vadEndTimer);
+        if (state.vadStartTimer) clearTimeout(state.vadStartTimer);
+        if (state.speechWatchdogTimer) clearInterval(state.speechWatchdogTimer);
         if (state.vad && state.vad.audioContext) void state.vad.audioContext.close();
+        if (state.vadAudioContext) void state.vadAudioContext.close();
         if (state.ws) {
           state.ws.onclose = null;
           state.ws.close();
@@ -594,6 +717,13 @@
         state.vad = null;
         state.vadTimer = null;
         state.vadEndTimer = null;
+        state.vadStartTimer = null;
+        state.speechWatchdogTimer = null;
+        state.vadAudioContext = null;
+        state.vadAnalyser = null;
+        state.vadPendingStart = null;
+        state.speakingStartedAt = 0;
+        state.speakingSeq = null;
         state.trackCounts = { audio: 0, video: 0 };
         state.vadMode = null;
         state.speaking = false;

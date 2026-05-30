@@ -23,6 +23,8 @@ class RecallClient:
         bot_name: str,
         variant: str,
         output_media_url: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        recording_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         logger.info(
             "recall create_bot start meeting_url_provided=%s output_media=%s variant=%s",
@@ -41,6 +43,10 @@ class RecallClient:
         }
         if output_media_url is not None:
             payload["output_media"] = self._webpage_output_media(output_media_url)
+        if metadata is not None:
+            payload["metadata"] = metadata
+        if recording_config is not None:
+            payload["recording_config"] = recording_config
 
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(

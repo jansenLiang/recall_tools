@@ -50,6 +50,15 @@ class Settings:
         self.log_file = env("LOG_FILE", "logs/recall_tools.log")
         self.bot_name = env("BOT_NAME", "Mirako Recall Bridge")
         self.recall_bot_variant = env("RECALL_BOT_VARIANT", "web_4_core")
+        self.recall_webhook_secret = env("RECALL_WEBHOOK_SECRET")
+        self.recall_transcript_enabled = env("RECALL_TRANSCRIPT_ENABLED", "true").lower() in {"1", "true", "yes"}
+        self.recall_transcript_language_code = env("RECALL_TRANSCRIPT_LANGUAGE_CODE", "en")
+        self.recall_transcript_mode = env("RECALL_TRANSCRIPT_MODE", "prioritize_low_latency")
+
+        self.metis_memory_base_url = env("METIS_MEMORY_BASE_URL", self.live_stream_gateway_url)
+        self.metis_memory_insert_path = env("METIS_MEMORY_INSERT_PATH", "/memory/insert")
+        self.metis_memory_api_key = env("METIS_MEMORY_API_KEY")
+        self.metis_memory_user = env("METIS_MEMORY_USER", "default")
 
         self.zoom_oauth_client_id = env("ZOOM_OAUTH_CLIENT_ID")
         self.zoom_oauth_client_secret = env("ZOOM_OAUTH_CLIENT_SECRET")

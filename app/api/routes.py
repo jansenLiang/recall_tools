@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import secrets
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
 from app.core.config import settings
@@ -24,6 +27,37 @@ def verify_api_key(x_api_key: str | None = Header(default=None)) -> None:
     if x_api_key and secrets.compare_digest(x_api_key, settings.service_api_key):
         return
     raise HTTPException(status_code=401, detail="Invalid or missing API key.")
+
+
+def verify_recall_webhook(headers: dict[str, str], raw_body: bytes) -> None:
+    if not settings.recall_webhook_secret:
+        return
+    secret = settings.recall_webhook_secret
+    if not secret.startswith("whsec_"):
+        raise HTTPException(status_code=500, detail="RECALL_WEBHOOK_SECRET must start with whsec_.")
+    msg_id = headers.get("webhook-id") or headers.get("svix-id")
+    msg_timestamp = headers.get("webhook-timestamp") or headers.get("svix-timestamp")
+    msg_signature = headers.get("webhook-signature") or headers.get("svix-signature")
+    if not msg_id or not msg_timestamp or not msg_signature:
+        raise HTTPException(status_code=400, detail="Missing Recall webhook signature headers.")
+
+    try:
+        key = base64.b64decode(secret.removeprefix("whsec_"))
+    except ValueError:
+        raise HTTPException(status_code=500, detail="RECALL_WEBHOOK_SECRET is not valid base64.")
+    signed = b".".join([msg_id.encode("utf-8"), msg_timestamp.encode("utf-8"), raw_body])
+    expected = hmac.new(key, signed, hashlib.sha256).digest()
+    for versioned_sig in msg_signature.split(" "):
+        version, _, signature = versioned_sig.partition(",")
+        if version != "v1" or not signature:
+            continue
+        try:
+            actual = base64.b64decode(signature)
+        except ValueError:
+            continue
+        if hmac.compare_digest(expected, actual):
+            return
+    raise HTTPException(status_code=400, detail="Invalid Recall webhook signature.")
 
 
 @router.get("/", response_class=HTMLResponse, include_in_schema=False)
@@ -119,6 +153,21 @@ async def bridge_telemetry(req: BridgeTelemetryRequest) -> dict[str, bool]:
         req.elapsed_ms,
         json.dumps(req.payload or {}, ensure_ascii=True, sort_keys=True),
     )
+    return {"ok": True}
+
+
+@router.post("/api/recall/transcript", include_in_schema=False)
+async def recall_transcript_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> dict[str, bool]:
+    raw_body = await request.body()
+    verify_recall_webhook({key.lower(): value for key, value in request.headers.items()}, raw_body)
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+    background_tasks.add_task(session_service.handle_recall_transcript, payload)
     return {"ok": True}
 
 

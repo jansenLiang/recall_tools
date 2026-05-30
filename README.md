@@ -130,6 +130,8 @@ curl -X POST http://localhost:8000/api/sessions \
 
 `gateway_url` is not accepted as an API parameter. It is always read from the `LIVE_STREAM_GATEWAY_URL` environment variable. `mirako_session_id` is sent to `live-stream-gateway` as the gateway `api_key` and becomes the gateway session id.
 
+`memory_user` is optional. When omitted, transcript memory inserts use `METIS_MEMORY_USER`.
+
 `mode` values:
 
 - `video`: the gateway sends audio and video into the meeting through the Recall bot.
@@ -259,12 +261,45 @@ If you use the public URL provided by RunPod, set it as `PUBLIC_BASE_URL`. If yo
 
 - Create Bot: `POST /api/v1/bot/`
 - Output Media: the `output_media` parameter is sent in the Create Bot request
+- Real-time transcript webhook: `recording_config.realtime_endpoints[].url = PUBLIC_BASE_URL/api/recall/transcript`
 - Leave Call: `POST /api/v1/bot/{id}/leave_call/`
+
+## Meeting Memory
+
+When `RECALL_TRANSCRIPT_ENABLED=true`, new bots are created with Recall real-time transcription enabled. Final `transcript.data` events are received at `/api/recall/transcript`, matched back to the in-memory session through Recall endpoint/bot metadata, stored on the runtime session, and sent to Metis memory through:
+
+```text
+POST {METIS_MEMORY_BASE_URL}{METIS_MEMORY_INSERT_PATH}
+```
+
+The request body follows this shape:
+
+```json
+{
+  "session_id": "mirako-session-id",
+  "content": "Duncan prefers the weekly meeting summary to be short and action-oriented.",
+  "user": "duncan",
+  "speaker": "Duncan",
+  "role": "meeting_note",
+  "source": "recall.ai",
+  "metadata": {
+    "topic": "meeting",
+    "importance": "high",
+    "recall_session_id": "recall-tools-session-id",
+    "recall_bot_id": "recall-bot-id",
+    "participant": {}
+  }
+}
+```
+
+Set `RECALL_WEBHOOK_SECRET` to the Recall workspace secret so incoming transcript webhooks are verified. If it is empty, webhook signature verification is skipped, which is useful only for local testing.
 
 Docs:
 
 - https://docs.recall.ai/reference/bot_create
 - https://docs.recall.ai/docs/stream-media
+- https://docs.recall.ai/docs/bot-real-time-transcription
+- https://docs.recall.ai/docs/authenticating-requests-from-recallai
 - https://docs.recall.ai/v1.10/reference/bot_leave_call_create
 
 ## Notes

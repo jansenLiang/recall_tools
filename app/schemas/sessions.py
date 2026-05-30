@@ -30,6 +30,11 @@ class CreateSessionRequest(BaseModel):
         description="Public HTTPS base URL for this service. Defaults to PUBLIC_BASE_URL.",
     )
     bot_name: str | None = Field(default=None, min_length=1, max_length=100)
+    memory_user: str | None = Field(
+        default=None,
+        min_length=1,
+        description="User id/name sent to Metis memory. Defaults to METIS_MEMORY_USER.",
+    )
     zoom_topic: str | None = None
     zoom_duration_minutes: int | None = Field(default=None, ge=1, le=1440)
 

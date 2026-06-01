@@ -18,5 +18,8 @@ class Session:
     recall_bot: dict[str, Any]
     memory_user: str
     transcript_utterances: list[dict[str, Any]]
+    meeting_participants: dict[str, dict[str, Any]]
+    meeting_participant_count: int
+    conversation_mode: str
     created_meeting: dict[str, Any] | None
     should_end_created_meeting: bool

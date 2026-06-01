@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import secrets
 
 from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request
@@ -19,6 +20,25 @@ from app.services.session_service import SessionServiceError, session_service
 router = APIRouter()
 logger = logging.getLogger(__name__)
 bridge_logger = logging.getLogger("bridge.telemetry")
+recall_webhook_logger = logging.getLogger("recall.webhook")
+
+
+def _safe_body_preview(raw_body: bytes, limit: int = 4096) -> str:
+    text = raw_body[:limit].decode("utf-8", errors="replace")
+    if len(raw_body) > limit:
+        return f"{text}...<truncated {len(raw_body) - limit} bytes>"
+    return text
+
+
+def _safe_headers(headers: dict[str, str]) -> dict[str, str]:
+    safe: dict[str, str] = {}
+    for key, value in headers.items():
+        lower = key.lower()
+        if lower in {"authorization", "cookie", "webhook-signature", "svix-signature"}:
+            safe[key] = "<redacted>"
+        else:
+            safe[key] = value
+    return safe
 
 
 def verify_api_key(x_api_key: str | None = Header(default=None)) -> None:
@@ -39,6 +59,11 @@ def verify_recall_webhook(headers: dict[str, str], raw_body: bytes) -> None:
     msg_timestamp = headers.get("webhook-timestamp") or headers.get("svix-timestamp")
     msg_signature = headers.get("webhook-signature") or headers.get("svix-signature")
     if not msg_id or not msg_timestamp or not msg_signature:
+        recall_webhook_logger.warning(
+            "recall webhook missing signature headers headers=%s body=%s",
+            json.dumps(_safe_headers(headers), ensure_ascii=True, sort_keys=True),
+            _safe_body_preview(raw_body),
+        )
         raise HTTPException(status_code=400, detail="Missing Recall webhook signature headers.")
 
     try:
@@ -47,16 +72,25 @@ def verify_recall_webhook(headers: dict[str, str], raw_body: bytes) -> None:
         raise HTTPException(status_code=500, detail="RECALL_WEBHOOK_SECRET is not valid base64.")
     signed = b".".join([msg_id.encode("utf-8"), msg_timestamp.encode("utf-8"), raw_body])
     expected = hmac.new(key, signed, hashlib.sha256).digest()
-    for versioned_sig in msg_signature.split(" "):
+    expected_base64 = base64.b64encode(expected).decode("ascii")
+    # Recall uses Svix-style signatures; tolerate either space or comma separated
+    # versioned tokens so we can handle the header format exposed by proxies.
+    versioned_sigs = re.findall(r"v\d+,[^\s,]+", msg_signature)
+    if not versioned_sigs and msg_signature:
+        versioned_sigs = [msg_signature]
+    for versioned_sig in versioned_sigs:
         version, _, signature = versioned_sig.partition(",")
         if version != "v1" or not signature:
             continue
-        try:
-            actual = base64.b64decode(signature)
-        except ValueError:
-            continue
-        if hmac.compare_digest(expected, actual):
+        if hmac.compare_digest(expected_base64, signature):
             return
+    recall_webhook_logger.warning(
+        "recall webhook invalid signature headers=%s body=%s expected_len=%s signature_tokens=%s",
+        json.dumps(_safe_headers(headers), ensure_ascii=True, sort_keys=True),
+        _safe_body_preview(raw_body),
+        len(expected_base64),
+        len(versioned_sigs),
+    )
     raise HTTPException(status_code=400, detail="Invalid Recall webhook signature.")
 
 
@@ -153,6 +187,11 @@ async def bridge_telemetry(req: BridgeTelemetryRequest) -> dict[str, bool]:
         req.elapsed_ms,
         json.dumps(req.payload or {}, ensure_ascii=True, sort_keys=True),
     )
+    if req.event == "gateway-session-create-success" and known_session:
+        try:
+            await session_service.apply_conversation_mode(req.session_id, req.gateway_session_id)
+        except Exception:
+            logger.exception("bridge conversation mode apply failed session_id=%s", req.session_id)
     return {"ok": True}
 
 
@@ -162,12 +201,53 @@ async def recall_transcript_webhook(
     background_tasks: BackgroundTasks,
 ) -> dict[str, bool]:
     raw_body = await request.body()
-    verify_recall_webhook({key.lower(): value for key, value in request.headers.items()}, raw_body)
+    headers = {key.lower(): value for key, value in request.headers.items()}
+    verify_recall_webhook(headers, raw_body)
     try:
         payload = json.loads(raw_body.decode("utf-8"))
     except ValueError:
+        recall_webhook_logger.warning(
+            "recall transcript invalid json headers=%s body=%s",
+            json.dumps(_safe_headers(headers), ensure_ascii=True, sort_keys=True),
+            _safe_body_preview(raw_body),
+        )
         raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+    metadata = (((payload.get("data") or {}).get("realtime_endpoint") or {}).get("metadata") or {})
+    recall_webhook_logger.info(
+        "recall transcript payload event=%s session_id=%s mirako_session_id=%s",
+        payload.get("event"),
+        metadata.get("session_id"),
+        metadata.get("mirako_session_id"),
+    )
     background_tasks.add_task(session_service.handle_recall_transcript, payload)
+    return {"ok": True}
+
+
+@router.post("/api/recall/participant-events", include_in_schema=False)
+async def recall_participant_events_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> dict[str, bool]:
+    raw_body = await request.body()
+    headers = {key.lower(): value for key, value in request.headers.items()}
+    verify_recall_webhook(headers, raw_body)
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except ValueError:
+        recall_webhook_logger.warning(
+            "recall participant invalid json headers=%s body=%s",
+            json.dumps(_safe_headers(headers), ensure_ascii=True, sort_keys=True),
+            _safe_body_preview(raw_body),
+        )
+        raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+    metadata = (((payload.get("data") or {}).get("realtime_endpoint") or {}).get("metadata") or {})
+    recall_webhook_logger.info(
+        "recall participant payload event=%s session_id=%s mirako_session_id=%s",
+        payload.get("event"),
+        metadata.get("session_id"),
+        metadata.get("mirako_session_id"),
+    )
+    background_tasks.add_task(session_service.handle_recall_participant_event, payload)
     return {"ok": True}
 
 
@@ -183,5 +263,6 @@ async def bridge(session_id: str) -> HTMLResponse:
         "gatewayUrl": session.gateway_url,
         "mirakoSessionId": session.mirako_session_id,
         "mode": session.mode,
+        "conversationMode": session.conversation_mode,
     }
     return HTMLResponse(html.replace("__BRIDGE_CONFIG__", json.dumps(bridge_config)))

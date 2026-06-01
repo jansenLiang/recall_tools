@@ -38,6 +38,15 @@ class SessionService:
                 return session
         return None
 
+    async def apply_conversation_mode(self, session_id: str, gateway_session_id: str | None = None) -> None:
+        session = self.get_session(session_id)
+        if session is None:
+            logger.warning("conversation mode apply skipped unknown session_id=%s", session_id)
+            return
+        if gateway_session_id:
+            session.mirako_session_id = gateway_session_id
+        await self._set_metis_conversation_mode(session, session.conversation_mode, include_session_id=False)
+
     async def create_session(self, req: CreateSessionRequest) -> CreateSessionResponse:
         mirako_session_id = req.mirako_session_id
         gateway_url = self._normalize_gateway_url(None)
@@ -74,6 +83,7 @@ class SessionService:
                 mirako_session_id,
             )
 
+        initial_conversation_mode = self._initial_conversation_mode()
         self.sessions[session_id] = Session(
             session_id=session_id,
             created_at=time.time(),
@@ -87,15 +97,20 @@ class SessionService:
             recall_bot={},
             memory_user=req.memory_user or self.settings.metis_memory_user,
             transcript_utterances=[],
+            meeting_participants={},
+            meeting_participant_count=0,
+            conversation_mode=initial_conversation_mode,
             created_meeting=created_meeting,
             should_end_created_meeting=bool(created_meeting),
         )
         logger.info(
-            "session stored session_id=%s mirako_session_id=%s provider=%s mode=%s bridge_url=%s",
+            "session stored session_id=%s mirako_session_id=%s provider=%s mode=%s conversation_mode_policy=%s conversation_mode=%s bridge_url=%s",
             session_id,
             mirako_session_id,
             req.meeting_provider,
             req.mode,
+            self.settings.conversation_mode_policy,
+            initial_conversation_mode,
             bridge_url,
         )
 
@@ -168,6 +183,70 @@ class SessionService:
             return {"ok": True, "stored": True}
         except Exception:
             logger.exception("recall transcript processing failed")
+            return {"ok": False}
+
+    async def handle_recall_participant_event(self, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            event = str(payload.get("event") or "")
+            if event not in {"participant_events.join", "participant_events.leave", "participant_events.update"}:
+                logger.info("recall participant webhook ignored event=%s", event)
+                return {"ok": True, "ignored": True}
+
+            session = self._session_from_recall_payload(payload)
+            if session is None:
+                logger.warning("recall participant webhook unknown session payload=%s", payload)
+                return {"ok": True, "ignored": True, "reason": "unknown_session"}
+
+            participant = (((payload.get("data") or {}).get("data") or {}).get("participant") or {})
+            participant_id = self._participant_key(participant)
+            if not participant_id:
+                logger.warning("recall participant webhook missing participant id event=%s payload=%s", event, payload)
+                return {"ok": True, "ignored": True, "reason": "missing_participant_id"}
+
+            if event == "participant_events.leave":
+                session.meeting_participants.pop(participant_id, None)
+            else:
+                session.meeting_participants[participant_id] = participant
+
+            session.meeting_participant_count = len(session.meeting_participants)
+            desired_mode = self._desired_conversation_mode(session.meeting_participant_count)
+            if desired_mode is None:
+                logger.info(
+                    "participant event processed without mode switch session_id=%s event=%s participant_id=%s count=%s policy=%s current_mode=%s",
+                    session.session_id,
+                    event,
+                    participant_id,
+                    session.meeting_participant_count,
+                    self.settings.conversation_mode_policy,
+                    session.conversation_mode,
+                )
+                return {
+                    "ok": True,
+                    "participant_count": session.meeting_participant_count,
+                    "conversation_mode": session.conversation_mode,
+                }
+            mode_changed = desired_mode != session.conversation_mode
+            logger.info(
+                "participant event processed session_id=%s event=%s participant_id=%s count=%s desired_mode=%s current_mode=%s mode_changed=%s",
+                session.session_id,
+                event,
+                participant_id,
+                session.meeting_participant_count,
+                desired_mode,
+                session.conversation_mode,
+                mode_changed,
+            )
+            if mode_changed:
+                await self._set_metis_conversation_mode(session, desired_mode)
+                session.conversation_mode = desired_mode
+
+            return {
+                "ok": True,
+                "participant_count": session.meeting_participant_count,
+                "conversation_mode": session.conversation_mode,
+            }
+        except Exception:
+            logger.exception("recall participant event processing failed")
             return {"ok": False}
 
     async def close_session(self, session_id: str) -> CloseSessionResponse:
@@ -330,9 +409,75 @@ class SessionService:
                     "url": f"{public_base_url}/api/recall/transcript",
                     "events": ["transcript.data"],
                     "metadata": {"session_id": session_id, "mirako_session_id": req.mirako_session_id},
+                },
+                {
+                    "type": "webhook",
+                    "url": f"{public_base_url}/api/recall/participant-events",
+                    "events": [
+                        "participant_events.join",
+                        "participant_events.leave",
+                        "participant_events.update",
+                    ],
+                    "metadata": {"session_id": session_id, "mirako_session_id": req.mirako_session_id},
                 }
             ],
         }
+
+    @staticmethod
+    def _participant_key(participant: dict[str, Any]) -> str:
+        participant_id = participant.get("id")
+        if participant_id is not None:
+            return str(participant_id)
+        email = participant.get("email")
+        if email:
+            return f"email:{email}"
+        name = participant.get("name")
+        if name:
+            return f"name:{name}"
+        return ""
+
+    def _initial_conversation_mode(self) -> str:
+        policy = self.settings.conversation_mode_policy
+        if policy in {"multi", "single"}:
+            return policy
+        return "multi"
+
+    def _desired_conversation_mode(self, participant_count: int) -> str | None:
+        policy = self.settings.conversation_mode_policy
+        if policy in {"multi", "single"}:
+            return None
+        return "multi" if participant_count > 2 else "single"
+
+    async def _set_metis_conversation_mode(self, session: Session, mode: str, include_session_id: bool = True) -> None:
+        base_url = self.settings.metis_control_base_url.rstrip("/")
+        if not base_url:
+            logger.warning("metis conversation mode skipped because METIS_CONTROL_BASE_URL is empty")
+            return
+
+        body = {"mode": mode}
+        if include_session_id:
+            body["session_id"] = session.mirako_session_id
+        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        if self.settings.metis_control_api_key:
+            headers["Authorization"] = f"Bearer {self.settings.metis_control_api_key}"
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.post(f"{base_url}/session/mode", headers=headers, json=body)
+            if response.status_code >= 400:
+                logger.error(
+                    "metis conversation mode failed session_id=%s mode=%s status_code=%s response=%s",
+                    session.session_id,
+                    mode,
+                    response.status_code,
+                    response.text,
+                )
+            response.raise_for_status()
+            logger.info(
+                "metis conversation mode set session_id=%s mirako_session_id=%s mode=%s participant_count=%s",
+                session.session_id,
+                session.mirako_session_id,
+                mode,
+                session.meeting_participant_count,
+            )
 
     def _session_from_recall_payload(self, payload: dict[str, Any]) -> Session | None:
         data = payload.get("data") or {}
@@ -358,8 +503,9 @@ class SessionService:
         payload: dict[str, Any],
     ) -> None:
         base_url = self.settings.metis_memory_base_url.rstrip("/")
-        if not base_url:
-            logger.warning("metis memory skipped because METIS_MEMORY_BASE_URL is empty")
+        path = self.settings.metis_memory_insert_path
+        if not base_url or not path:
+            logger.info("metis memory skipped because METIS_MEMORY_BASE_URL or METIS_MEMORY_INSERT_PATH is empty")
             return
 
         body = {
@@ -382,14 +528,18 @@ class SessionService:
         if self.settings.metis_memory_api_key:
             headers["Authorization"] = f"Bearer {self.settings.metis_memory_api_key}"
         async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.post(
-                f"{base_url}{self.settings.metis_memory_insert_path}",
-                headers=headers,
-                json=body,
-            )
+            try:
+                response = await client.post(
+                    f"{base_url}{path}",
+                    headers=headers,
+                    json=body,
+                )
+            except httpx.HTTPError as exc:
+                logger.error("metis memory insert request failed base_url=%s path=%s error=%s", base_url, path, exc)
+                return
             if response.status_code >= 400:
                 logger.error("metis memory insert failed status_code=%s response=%s", response.status_code, response.text)
-            response.raise_for_status()
+                return
 
     async def _best_effort_leave_recall_bot(self, bot_id: str) -> None:
         try:

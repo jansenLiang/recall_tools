@@ -230,11 +230,17 @@
       }
 
       async function createGatewaySession() {
-        sendTelemetry("gateway-session-create-start", { gatewayUrl: config.gatewayUrl, mediaMode });
+        sendTelemetry("gateway-session-create-start", {
+          gatewayUrl: config.gatewayUrl,
+          mediaMode,
+          conversationMode: config.conversationMode || "multi",
+        });
         const setup = await postJson("/api/sessions", {
           api_key: config.mirakoSessionId,
           media_mode: mediaMode,
+          conversation_mode: config.conversationMode || "multi",
         });
+        state.gatewaySessionId = setup.session_id;
         sendTelemetry("gateway-session-create-success", {
           sessionId: setup.session_id,
           hasSdpOffer: Boolean(setup.sdp_offer),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from app.clients.zoom import ZoomMeetingClient
@@ -28,7 +29,8 @@ class ZoomMeetingStrategy:
         return await self._client().create_meeting(
             {
                 "topic": topic,
-                "type": 1,
+                "type": 2,
+                "start_time": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
                 "duration": duration,
                 "settings": {
                     "join_before_host": True,

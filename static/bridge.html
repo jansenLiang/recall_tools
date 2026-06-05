@@ -78,8 +78,8 @@
     </main>
     <div class="status" id="status">Starting bridge</div>
 
-    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.14.0/dist/ort.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.7/dist/bundle.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.23.2/dist/ort.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.30/dist/bundle.min.js"></script>
     <script>
       const config = __BRIDGE_CONFIG__;
       const mediaMode = config.mode === "audio" ? "audio-only" : "video-only";
@@ -107,12 +107,25 @@
         vadEndTimer: null,
         vadMode: null,
         vadSeq: 0,
+        pendingStart: null,
+        pendingStartTimer: null,
         vadPendingStart: null,
         vadStartTimer: null,
         vadAudioContext: null,
         vadAnalyser: null,
+        audioUploadContext: null,
+        audioUploadSource: null,
+        audioUploadProcessor: null,
+        audioUploadSink: null,
+        audioUploadPending: new Float32Array(0),
+        audioUploadPreSpeech: new Float32Array(0),
+        audioUploadChunks: 0,
+        audioUploadSamples: 0,
+        vadEndFlushTimer: null,
         speakingStartedAt: 0,
         speakingSeq: null,
+        lastVadEndAt: 0,
+        vadStartSuppressUntil: 0,
         startedAt: Date.now(),
         trackCounts: { audio: 0, video: 0 },
         speaking: false,
@@ -128,6 +141,14 @@
         statusEl.classList.toggle("error", isError);
         console[isError ? "error" : "log"](`[bridge] ${message}`);
         sendTelemetry("status", { message, isError });
+      }
+
+      function showServiceError(error) {
+        const message = error?.message || String(error || "unknown error");
+        statusEl.textContent = "Service temporarily unavailable. Please try again later.";
+        statusEl.classList.add("error");
+        fallbackEl.textContent = "Service unavailable";
+        sendTelemetry("service-error", { message, error: safeError(error) });
       }
 
       function safeError(error) {
@@ -162,6 +183,17 @@
             keepalive: true,
           }).catch(() => {});
         } catch (_) {}
+      }
+
+      function playNotificationAudio(url) {
+        state.vadStartSuppressUntil = Math.max(state.vadStartSuppressUntil, Date.now() + 1200);
+        const audio = new Audio(url && !url.startsWith("/audio/") ? url : "/static/dd.mp3");
+        audio.addEventListener("ended", () => {
+          state.vadStartSuppressUntil = Math.max(state.vadStartSuppressUntil, Date.now() + 300);
+        });
+        audio.play().catch((error) => {
+          sendTelemetry("notification-audio-failed", { error: safeError(error) });
+        });
       }
 
       function summarizeTrack(track) {
@@ -267,13 +299,79 @@
         state.ws.send(JSON.stringify(message));
       }
 
+      function sendAudioBoundary(type, metrics, reason) {
+        if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+          sendTelemetry("vad-boundary-skipped", {
+            type,
+            reason: "ws-not-open",
+            seq: metrics.seq,
+            duration_ms: metrics.durationMs || 0,
+            rms: metrics.rms,
+            peak: metrics.peak,
+          });
+          return false;
+        }
+
+        state.ws.send(
+          JSON.stringify({
+            type,
+            timestamp: Date.now(),
+            seq: metrics.seq,
+            duration_ms: metrics.durationMs || 0,
+            rms: metrics.rms,
+            peak: metrics.peak,
+            reason,
+          })
+        );
+        return true;
+      }
+
       const vadGate = {
-        startDelayMs: 80,
-        endHangoverMs: 300,
-        minStartRms: 0.02,
-        minStartPeak: 0.08,
+        active: false,
+        seq: 0,
+        starts: 0,
+        acceptedStarts: 0,
+        ends: 0,
+        misfires: 0,
+        rejectedShort: 0,
+        rejectedLowEnergy: 0,
+        duplicateStarts: 0,
+        duplicateEnds: 0,
+        lastAcceptedEndAt: 0,
+        lastStartSentAt: 0,
+        activeSeq: null,
+        activeStartedAt: 0,
+        minSpeechMs: 700,
+        startDelayMs: 120,
+        endHangoverMs: 650,
+        minStartRms: 0.015,
+        minStartPeak: 0.07,
+        minRestartGapMs: 250,
+        positiveSpeechThreshold: 0.45,
+        negativeSpeechThreshold: 0.30,
+        redemptionMs: 700,
+        uploadChunkSamples: 1600,
+        preSpeechSamples: 8000,
+        endTailFlushMs: 120,
         watchdogMs: 15000,
       };
+
+      function audioMetricsFromFloat32(audio) {
+        if (!audio || !audio.length) return { samples: 0, rms: 0, peak: 0, durationMs: 0 };
+        let sumSquares = 0;
+        let peak = 0;
+        for (const sample of audio) {
+          const value = Math.abs(sample || 0);
+          sumSquares += value * value;
+          if (value > peak) peak = value;
+        }
+        return {
+          samples: audio.length,
+          rms: Math.sqrt(sumSquares / audio.length),
+          peak,
+          durationMs: Math.round((audio.length / 16000) * 1000),
+        };
+      }
 
       function clearVadStartTimer() {
         if (state.vadStartTimer) {
@@ -285,7 +383,7 @@
 
       function currentAudioMetrics() {
         const analyser = state.vadAnalyser;
-        if (!analyser) return { rms: 0, peak: 0 };
+        if (!analyser) return { rms: 0, peak: 0, samples: 0 };
         const samples = new Float32Array(analyser.fftSize);
         analyser.getFloatTimeDomainData(samples);
         let sumSquares = 0;
@@ -295,7 +393,7 @@
           sumSquares += value * value;
           if (value > peak) peak = value;
         }
-        return { rms: Math.sqrt(sumSquares / samples.length), peak };
+        return { rms: Math.sqrt(sumSquares / samples.length), peak, samples: samples.length };
       }
 
       function attachVadAnalyser(stream) {
@@ -309,6 +407,156 @@
         } catch (error) {
           sendTelemetry("vad-analyser-failed", { error: safeError(error) });
         }
+      }
+
+      function appendFloat32(existing, incoming) {
+        if (!incoming || incoming.length === 0) return existing;
+        if (!existing || existing.length === 0) {
+          const copy = new Float32Array(incoming.length);
+          copy.set(incoming);
+          return copy;
+        }
+        const merged = new Float32Array(existing.length + incoming.length);
+        merged.set(existing, 0);
+        merged.set(incoming, existing.length);
+        return merged;
+      }
+
+      function keepTrailingFloat32(samples, maxSamples) {
+        if (!samples || samples.length <= maxSamples) return samples || new Float32Array(0);
+        return samples.slice(samples.length - maxSamples);
+      }
+
+      function resampleTo16k(input, inputSampleRate) {
+        if (!input || input.length === 0) return new Float32Array(0);
+        if (inputSampleRate === 16000) {
+          const copy = new Float32Array(input.length);
+          copy.set(input);
+          return copy;
+        }
+        const outputLength = Math.max(1, Math.round((input.length * 16000) / inputSampleRate));
+        const output = new Float32Array(outputLength);
+        const ratio = inputSampleRate / 16000;
+        for (let i = 0; i < outputLength; i++) {
+          const sourceIndex = i * ratio;
+          const left = Math.floor(sourceIndex);
+          const right = Math.min(left + 1, input.length - 1);
+          const frac = sourceIndex - left;
+          output[i] = input[left] * (1 - frac) + input[right] * frac;
+        }
+        return output;
+      }
+
+      function pcm16Bytes(samples) {
+        const bytes = new Uint8Array(samples.length * 2);
+        const view = new DataView(bytes.buffer);
+        for (let i = 0; i < samples.length; i++) {
+          const clamped = Math.max(-1, Math.min(1, samples[i] || 0));
+          const value = clamped < 0 ? Math.round(clamped * 32768) : Math.round(clamped * 32767);
+          view.setInt16(i * 2, value, true);
+        }
+        return bytes;
+      }
+
+      function binaryAudioFrame(samples) {
+        const payload = pcm16Bytes(samples);
+        const frame = new Uint8Array(13 + payload.length);
+        const view = new DataView(frame.buffer);
+        frame[0] = 0x01;
+        view.setBigUint64(1, BigInt(Date.now()), false);
+        view.setUint32(9, payload.length, false);
+        frame.set(payload, 13);
+        return frame;
+      }
+
+      function sendAudioSamples(samples) {
+        if (!samples || samples.length === 0) return;
+        if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+          sendTelemetry("pcm-upload-skipped", { samples: samples.length, reason: "ws-not-open" });
+          return;
+        }
+        state.ws.send(binaryAudioFrame(samples));
+        state.audioUploadChunks += 1;
+        state.audioUploadSamples += samples.length;
+      }
+
+      function appendUploadSamples(samples) {
+        state.audioUploadPending = appendFloat32(state.audioUploadPending, samples);
+        while (state.audioUploadPending.length >= vadGate.uploadChunkSamples) {
+          const chunk = state.audioUploadPending.slice(0, vadGate.uploadChunkSamples);
+          state.audioUploadPending = state.audioUploadPending.slice(vadGate.uploadChunkSamples);
+          sendAudioSamples(chunk);
+        }
+      }
+
+      function flushUploadSamples() {
+        if (state.audioUploadPending.length > 0) {
+          sendAudioSamples(state.audioUploadPending);
+          state.audioUploadPending = new Float32Array(0);
+        }
+      }
+
+      function flushPreSpeechToUpload() {
+        if (state.audioUploadPreSpeech.length > 0) {
+          appendUploadSamples(state.audioUploadPreSpeech);
+          state.audioUploadPreSpeech = new Float32Array(0);
+        }
+      }
+
+      function startPcmUploader(stream) {
+        stopPcmUploader();
+        const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+        if (!AudioContextCtor) throw new Error("AudioContext is not available for PCM upload");
+        state.audioUploadContext = new AudioContextCtor({ sampleRate: 48000 });
+        state.audioUploadSource = state.audioUploadContext.createMediaStreamSource(stream);
+        state.audioUploadProcessor = state.audioUploadContext.createScriptProcessor(4096, 1, 1);
+        state.audioUploadSink = state.audioUploadContext.createGain();
+        state.audioUploadSink.gain.value = 0;
+        state.audioUploadPending = new Float32Array(0);
+        state.audioUploadPreSpeech = new Float32Array(0);
+        state.audioUploadChunks = 0;
+        state.audioUploadSamples = 0;
+        state.audioUploadProcessor.onaudioprocess = (event) => {
+          const input = event.inputBuffer.getChannelData(0);
+          const copied = new Float32Array(input.length);
+          copied.set(input);
+          const resampled = resampleTo16k(copied, state.audioUploadContext.sampleRate || 48000);
+          if (vadGate.active) {
+            appendUploadSamples(resampled);
+          } else {
+            state.audioUploadPreSpeech = keepTrailingFloat32(
+              appendFloat32(state.audioUploadPreSpeech, resampled),
+              vadGate.preSpeechSamples
+            );
+          }
+        };
+        state.audioUploadSource.connect(state.audioUploadProcessor);
+        state.audioUploadProcessor.connect(state.audioUploadSink);
+        state.audioUploadSink.connect(state.audioUploadContext.destination);
+        void state.audioUploadContext.resume().catch(() => undefined);
+        sendTelemetry("pcm-uploader-ready", { sampleRate: state.audioUploadContext.sampleRate });
+      }
+
+      function stopPcmUploader() {
+        if (state.audioUploadProcessor) {
+          state.audioUploadProcessor.disconnect();
+          state.audioUploadProcessor.onaudioprocess = null;
+          state.audioUploadProcessor = null;
+        }
+        if (state.audioUploadSource) {
+          state.audioUploadSource.disconnect();
+          state.audioUploadSource = null;
+        }
+        if (state.audioUploadSink) {
+          state.audioUploadSink.disconnect();
+          state.audioUploadSink = null;
+        }
+        if (state.audioUploadContext) {
+          void state.audioUploadContext.close().catch(() => undefined);
+          state.audioUploadContext = null;
+        }
+        state.audioUploadPending = new Float32Array(0);
+        state.audioUploadPreSpeech = new Float32Array(0);
       }
 
       function sendIceCandidate(candidate) {
@@ -334,96 +582,198 @@
         }
       }
 
-      function setSpeaking(speaking, detail = {}) {
-        if (state.speaking === speaking) return;
-        state.speaking = speaking;
-        const timestamp = Date.now();
-        if (speaking) {
-          state.speakingStartedAt = timestamp;
-          state.speakingSeq = detail.seq || ++state.vadSeq;
+      function acceptVadStart(metrics, reason) {
+        if (state.vadEndFlushTimer) {
+          clearTimeout(state.vadEndFlushTimer);
+          state.vadEndFlushTimer = null;
         }
-        const durationMs = speaking ? 0 : timestamp - state.speakingStartedAt;
-        const message = {
-          type: speaking ? "audio-start" : "audio-end",
-          timestamp,
-          seq: state.speakingSeq,
-          duration_ms: durationMs,
-          rms: detail.rms,
-          peak: detail.peak,
-          reason: detail.reason || (speaking ? "vad-start" : "vad-end"),
-        };
-        sendWs(message);
-        sendTelemetry("vad-speaking", {
-          speaking,
-          vadMode: state.vadMode,
-          seq: message.seq,
-          duration_ms: durationMs,
-          rms: detail.rms,
-          peak: detail.peak,
-          reason: message.reason,
-        });
-        if (!speaking) {
-          state.speakingSeq = null;
-          state.speakingStartedAt = 0;
-        }
-      }
-
-      function requestSpeaking(speaking, detail = {}) {
-        if (speaking) {
-          if (state.vadEndTimer) {
-            clearTimeout(state.vadEndTimer);
-            state.vadEndTimer = null;
-          }
-          setSpeaking(true, detail);
-          return;
-        }
-
-        if (state.vadEndTimer) return;
-        state.vadEndTimer = setTimeout(() => {
-          state.vadEndTimer = null;
-          setSpeaking(false, detail);
-        }, vadGate.endHangoverMs);
-      }
-
-      function requestVadStart() {
-        if (state.speaking || state.vadPendingStart) return;
-        const seq = ++state.vadSeq;
-        const startedAt = Date.now();
-        const initialMetrics = currentAudioMetrics();
-        state.vadPendingStart = { seq, startedAt, initialMetrics };
-        state.vadStartTimer = setTimeout(() => {
-          const pending = state.vadPendingStart;
-          if (!pending) return;
-          const delayedMetrics = currentAudioMetrics();
-          const rms = Math.max(pending.initialMetrics.rms, delayedMetrics.rms);
-          const peak = Math.max(pending.initialMetrics.peak, delayedMetrics.peak);
-          clearVadStartTimer();
-          if (rms < vadGate.minStartRms || peak < vadGate.minStartPeak) {
-            sendTelemetry("vad-start-rejected", {
-              seq,
-              reason: "low-energy",
-              duration_ms: Date.now() - startedAt,
-              rms,
-              peak,
-            });
-            return;
-          }
-          requestSpeaking(true, { seq, rms, peak, reason: "delayed-vad-start" });
-        }, vadGate.startDelayMs);
-      }
-
-      function requestVadEnd(reason = "vad-end") {
-        clearVadStartTimer();
-        requestSpeaking(false, { reason, ...currentAudioMetrics() });
-      }
-
-      function forceVadEnd(reason) {
-        clearVadStartTimer();
         if (state.vadEndTimer) {
           clearTimeout(state.vadEndTimer);
           state.vadEndTimer = null;
         }
-        if (state.speaking) setSpeaking(false, { reason, ...currentAudioMetrics() });
+        if (vadGate.active) {
+          vadGate.duplicateStarts += 1;
+          sendTelemetry("vad-start-rejected", { reason: "duplicate-active", ...metrics });
+          return false;
+        }
+
+        if (!sendAudioBoundary("audio-start", metrics, reason)) return false;
+
+        vadGate.active = true;
+        vadGate.acceptedStarts += 1;
+        vadGate.activeSeq = metrics.seq;
+        vadGate.lastStartSentAt = Date.now();
+        vadGate.activeStartedAt = vadGate.lastStartSentAt;
+        state.speaking = true;
+        state.speakingStartedAt = vadGate.activeStartedAt;
+        state.speakingSeq = metrics.seq;
+        flushPreSpeechToUpload();
+        sendTelemetry("vad-speaking", {
+          speaking: true,
+          vadMode: state.vadMode,
+          seq: metrics.seq,
+          duration_ms: metrics.durationMs || 0,
+          rms: metrics.rms,
+          peak: metrics.peak,
+          reason,
+          starts: vadGate.starts,
+          acceptedStarts: vadGate.acceptedStarts,
+          audioUploadChunks: state.audioUploadChunks,
+          audioUploadSamples: state.audioUploadSamples,
+        });
+        return true;
+      }
+
+      function clearPendingVadStart() {
+        if (state.pendingStartTimer) {
+          clearTimeout(state.pendingStartTimer);
+          state.pendingStartTimer = null;
+        }
+        state.pendingStart = null;
+        clearVadStartTimer();
+      }
+
+      function confirmVadStart(reason = "real-vad-start") {
+        const pending = state.pendingStart;
+        if (!pending) return false;
+        const liveMetrics = currentAudioMetrics();
+        const acceptedMetrics = {
+          seq: pending.seq,
+          durationMs: Date.now() - pending.startedAt,
+          rms: Math.max(pending.initial.rms, liveMetrics.rms),
+          peak: Math.max(pending.initial.peak, liveMetrics.peak),
+        };
+        clearPendingVadStart();
+        if (acceptedMetrics.rms < vadGate.minStartRms || acceptedMetrics.peak < vadGate.minStartPeak) {
+          rejectVadCandidate(acceptedMetrics, "low-energy");
+          return false;
+        }
+        return acceptVadStart(acceptedMetrics, reason);
+      }
+
+      function finishVadEnd(metrics, reason) {
+        if (!vadGate.active) {
+          vadGate.duplicateEnds += 1;
+          sendTelemetry("vad-end-rejected", { reason: "inactive", ...metrics });
+          return;
+        }
+        if (state.vadEndFlushTimer) clearTimeout(state.vadEndFlushTimer);
+        state.vadEndFlushTimer = setTimeout(() => {
+          state.vadEndFlushTimer = null;
+          flushUploadSamples();
+          sendAudioBoundary("audio-end", metrics, reason);
+          vadGate.active = false;
+          vadGate.activeSeq = null;
+          vadGate.activeStartedAt = 0;
+          vadGate.lastAcceptedEndAt = Date.now();
+          state.speaking = false;
+          state.speakingSeq = null;
+          state.speakingStartedAt = 0;
+          state.lastVadEndAt = vadGate.lastAcceptedEndAt;
+          sendTelemetry("vad-speaking", {
+            speaking: false,
+            vadMode: state.vadMode,
+            seq: metrics.seq,
+            duration_ms: metrics.durationMs || 0,
+            rms: metrics.rms,
+            peak: metrics.peak,
+            reason,
+            ends: vadGate.ends,
+            audioUploadChunks: state.audioUploadChunks,
+            audioUploadSamples: state.audioUploadSamples,
+          });
+        }, vadGate.endTailFlushMs);
+      }
+
+      function rejectVadCandidate(metrics, reason) {
+        if (reason === "short") vadGate.rejectedShort += 1;
+        if (reason === "low-energy") vadGate.rejectedLowEnergy += 1;
+        sendTelemetry("vad-start-rejected", { reason, ...metrics });
+      }
+
+      function requestVadStart() {
+        const now = Date.now();
+        if (now < state.vadStartSuppressUntil) {
+          sendTelemetry("vad-start-rejected", {
+            reason: "suppressed-local-playback",
+            suppressRemainingMs: state.vadStartSuppressUntil - now,
+            ...currentAudioMetrics(),
+          });
+          return;
+        }
+        if (state.lastVadEndAt && now - state.lastVadEndAt < vadGate.minRestartGapMs) {
+          sendTelemetry("vad-start-rejected", {
+            reason: "restart-gap",
+            sinceEndMs: now - state.lastVadEndAt,
+            ...currentAudioMetrics(),
+          });
+          return;
+        }
+        vadGate.starts += 1;
+        const seq = ++vadGate.seq;
+        const initialMetrics = currentAudioMetrics();
+        const metrics = { seq, durationMs: 0, rms: initialMetrics.rms, peak: initialMetrics.peak };
+
+        if (vadGate.active) {
+          if (state.vadEndFlushTimer) {
+            clearTimeout(state.vadEndFlushTimer);
+            state.vadEndFlushTimer = null;
+            sendTelemetry("vad-resumed", { reason: "tail-flush-cancelled", ...metrics });
+          }
+          vadGate.duplicateStarts += 1;
+          return;
+        }
+
+        if (state.pendingStart) {
+          vadGate.duplicateStarts += 1;
+          sendTelemetry("vad-start-rejected", { reason: "duplicate-pending", ...metrics });
+          return;
+        }
+
+        state.pendingStart = { seq, startedAt: now, initial: initialMetrics };
+        sendTelemetry("vad-start-candidate", { ...metrics, reason: "raw-vad-start" });
+      }
+
+      function requestVadEnd(reason = "vad-end", audio = null) {
+        vadGate.ends += 1;
+        const audioMetrics = audioMetricsFromFloat32(audio);
+        const liveMetrics = currentAudioMetrics();
+        const durationMs = vadGate.active && vadGate.lastStartSentAt
+          ? Math.max(audioMetrics.durationMs, Date.now() - vadGate.lastStartSentAt)
+          : audioMetrics.durationMs;
+        const metrics = {
+          seq: vadGate.activeSeq || vadGate.seq,
+          durationMs,
+          rms: Math.max(audioMetrics.rms, liveMetrics.rms),
+          peak: Math.max(audioMetrics.peak, liveMetrics.peak),
+          samples: audioMetrics.samples,
+        };
+
+        if (!vadGate.active && state.pendingStart) {
+          clearPendingVadStart();
+          rejectVadCandidate(metrics, "short-or-ended-before-start-confirmed");
+          return;
+        }
+
+        if (!vadGate.active) {
+          vadGate.duplicateEnds += 1;
+          sendTelemetry("vad-end-rejected", { reason: "inactive", ...metrics });
+          return;
+        }
+
+        const acceptedReason = durationMs >= vadGate.minSpeechMs ? reason : "short-vad-end";
+        finishVadEnd(metrics, acceptedReason);
+      }
+
+      function forceVadEnd(reason) {
+        clearPendingVadStart();
+        if (state.vadEndTimer) {
+          clearTimeout(state.vadEndTimer);
+          state.vadEndTimer = null;
+        }
+        if (vadGate.active) {
+          finishVadEnd({ seq: vadGate.activeSeq || vadGate.seq, durationMs: vadGate.activeStartedAt ? Date.now() - vadGate.activeStartedAt : 0, ...currentAudioMetrics() }, reason);
+        }
       }
 
       function startSpeechWatchdog() {
@@ -440,7 +790,7 @@
       async function startSimpleVad(stream) {
         const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
         if (!AudioContextCtor) {
-          setSpeaking(true);
+          requestVadStart();
           return;
         }
 
@@ -470,8 +820,11 @@
             silenceFrames += 1;
             speechFrames = 0;
           }
-          if (!state.speaking && speechFrames >= 3) requestVadStart();
-          if (state.speaking && silenceFrames >= 20) requestVadEnd("simple-vad-end");
+          if (!vadGate.active && speechFrames >= 3) {
+            requestVadStart();
+            confirmVadStart("simple-vad-start");
+          }
+          if (vadGate.active && silenceFrames >= 20) requestVadEnd("simple-vad-end");
         }, 100);
       }
 
@@ -479,19 +832,24 @@
         if (window.vad && window.vad.MicVAD) {
           try {
             state.vad = await window.vad.MicVAD.new({
-              positiveSpeechThreshold: 0.6,
-              negativeSpeechThreshold: 0.35,
-              redemptionFrames: 16,
-              preSpeechPadFrames: 5,
-              minSpeechFrames: 3,
+              baseAssetPath: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.30/dist/",
+              onnxWASMBasePath: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.23.2/dist/",
+              model: "v5",
+              positiveSpeechThreshold: vadGate.positiveSpeechThreshold,
+              negativeSpeechThreshold: vadGate.negativeSpeechThreshold,
+              redemptionMs: vadGate.redemptionMs,
+              preSpeechPadFrames: 8,
+              minSpeechFrames: 5,
+              getStream: async () => stream,
               onSpeechStart: requestVadStart,
-              onSpeechEnd: () => requestVadEnd("vad-end"),
+              onSpeechRealStart: () => confirmVadStart("real-vad-start"),
+              onSpeechEnd: (audio) => requestVadEnd("accepted-vad-end", audio),
               onVADMisfire: () => forceVadEnd("vad-misfire"),
             });
             state.vad.start();
-            state.vadMode = "ricky0123/vad-web";
+            state.vadMode = "ricky0123/vad-web-stream";
             setStatus("VAD ready; waiting for media");
-            sendTelemetry("vad-ready", { mode: state.vadMode });
+            sendTelemetry("vad-ready", { mode: state.vadMode, providedStream: true });
             return;
           } catch (error) {
             console.warn("vad-web failed; falling back to simple VAD", error);
@@ -596,12 +954,11 @@
 
         state.meetingAudioStream = await getMeetingAudioStream();
         attachVadAnalyser(state.meetingAudioStream);
+        startPcmUploader(state.meetingAudioStream);
         sendTelemetry("meeting-audio-stream", {
           tracks: state.meetingAudioStream.getTracks().map(summarizeTrack),
         });
-        for (const track of state.meetingAudioStream.getAudioTracks()) {
-          state.pc.addTrack(track, state.meetingAudioStream);
-        }
+        sendTelemetry("meeting-audio-upload", { transport: "websocket-pcm16" });
 
         const hasServerOffer = Boolean(setup.sdp_offer);
         let localAnswer = null;
@@ -666,6 +1023,11 @@
             if (message.type === "answer-applied") {
               await flushRemoteIceCandidates();
               setStatus("WebRTC answer applied; waiting for media");
+              return;
+            }
+            if (["wakeword-start", "wakeword-stop", "conversation-mode-changed"].includes(message.type)) {
+              playNotificationAudio(message.notificationAudioUrl);
+              sendTelemetry("notification-audio", { type: message.type });
             }
           };
 
@@ -703,6 +1065,8 @@
         if (state.speechWatchdogTimer) clearInterval(state.speechWatchdogTimer);
         if (state.vad && state.vad.audioContext) void state.vad.audioContext.close();
         if (state.vadAudioContext) void state.vadAudioContext.close();
+        if (state.vadEndFlushTimer) clearTimeout(state.vadEndFlushTimer);
+        stopPcmUploader();
         if (state.ws) {
           state.ws.onclose = null;
           state.ws.close();
@@ -723,13 +1087,23 @@
         state.vad = null;
         state.vadTimer = null;
         state.vadEndTimer = null;
+        state.pendingStart = null;
+        state.pendingStartTimer = null;
         state.vadStartTimer = null;
+        state.vadEndFlushTimer = null;
         state.speechWatchdogTimer = null;
         state.vadAudioContext = null;
         state.vadAnalyser = null;
         state.vadPendingStart = null;
         state.speakingStartedAt = 0;
         state.speakingSeq = null;
+        state.lastVadEndAt = 0;
+        state.vadStartSuppressUntil = 0;
+        vadGate.active = false;
+        vadGate.activeSeq = null;
+        vadGate.activeStartedAt = 0;
+        vadGate.lastStartSentAt = 0;
+        vadGate.lastAcceptedEndAt = 0;
         state.trackCounts = { audio: 0, video: 0 };
         state.vadMode = null;
         state.speaking = false;
@@ -807,7 +1181,7 @@
         });
       });
 
-      start().catch((error) => setStatus(error.stack || error.message || String(error), true));
+      start().catch((error) => showServiceError(error));
     </script>
   </body>
 </html>

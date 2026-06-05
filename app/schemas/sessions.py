@@ -30,11 +30,6 @@ class CreateSessionRequest(BaseModel):
         description="Public HTTPS base URL for this service. Defaults to PUBLIC_BASE_URL.",
     )
     bot_name: str | None = Field(default=None, min_length=1, max_length=100)
-    memory_user: str | None = Field(
-        default=None,
-        min_length=1,
-        description="User id/name sent to Metis memory. Defaults to METIS_MEMORY_USER.",
-    )
     zoom_topic: str | None = None
     zoom_duration_minutes: int | None = Field(default=None, ge=1, le=1440)
 
@@ -46,9 +41,9 @@ class CreateSessionResponse(BaseModel):
     bridge_url: str
     mode: Literal["video", "audio"]
     meeting_provider: Literal["zoom", "google_meet"]
-    created_meeting: dict[str, Any] | None = None
+    created_meeting: dict[str, Any] | None = Field(default=None, exclude=True)
     recall_bot_id: str
-    recall_bot: dict[str, Any]
+    recall_bot: dict[str, Any] = Field(default_factory=dict, exclude=True)
 
 
 class CloseSessionResponse(BaseModel):
@@ -59,6 +54,11 @@ class CloseSessionResponse(BaseModel):
     gateway_response: dict[str, Any] | None = None
     zoom_ended: bool = False
     zoom_response: dict[str, Any] | None = None
+
+
+class MeetingRecordsResponse(BaseModel):
+    records: list[dict[str, Any]]
+    pagination: dict[str, Any]
 
 
 class BridgeTelemetryRequest(BaseModel):

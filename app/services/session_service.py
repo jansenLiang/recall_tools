@@ -12,6 +12,7 @@ from app.core.config import Settings, settings
 from app.models.session import Session
 from app.schemas.sessions import CloseSessionResponse, CreateSessionRequest, CreateSessionResponse
 from app.services.meeting_strategies import get_meeting_strategy
+from app.services.recall_store import recall_store
 
 
 logger = logging.getLogger(__name__)
@@ -37,15 +38,6 @@ class SessionService:
             if session.recall_bot_id == bot_id:
                 return session
         return None
-
-    async def apply_conversation_mode(self, session_id: str, gateway_session_id: str | None = None) -> None:
-        session = self.get_session(session_id)
-        if session is None:
-            logger.warning("conversation mode apply skipped unknown session_id=%s", session_id)
-            return
-        if gateway_session_id:
-            session.mirako_session_id = gateway_session_id
-        await self._set_metis_conversation_mode(session, session.conversation_mode, include_session_id=False)
 
     async def create_session(self, req: CreateSessionRequest) -> CreateSessionResponse:
         mirako_session_id = req.mirako_session_id
@@ -95,13 +87,21 @@ class SessionService:
             bridge_url=bridge_url,
             recall_bot_id="",
             recall_bot={},
-            memory_user=req.memory_user or self.settings.metis_memory_user,
             transcript_utterances=[],
             meeting_participants={},
             meeting_participant_count=0,
             conversation_mode=initial_conversation_mode,
             created_meeting=created_meeting,
             should_end_created_meeting=bool(created_meeting),
+        )
+        recall_store.upsert_session(
+            session_id=session_id,
+            mirako_session_id=mirako_session_id,
+            meeting_provider=req.meeting_provider,
+            meeting_url=meeting_url,
+            mode=req.mode,
+            bridge_url=bridge_url,
+            created_meeting=created_meeting,
         )
         logger.info(
             "session stored session_id=%s mirako_session_id=%s provider=%s mode=%s conversation_mode_policy=%s conversation_mode=%s bridge_url=%s",
@@ -129,6 +129,19 @@ class SessionService:
             self.sessions.pop(session_id, None)
             await self._best_effort_end_created_meeting(req.meeting_provider, created_meeting)
             raise SessionServiceError(502, {"error": "recall_bot_id_missing", "bot": bot})
+        recall_store.upsert_session(
+            session_id=session_id,
+            mirako_session_id=mirako_session_id,
+            recall_bot_id=session.recall_bot_id,
+            recall_bot=bot,
+        )
+        recall_store.add_event(
+            event_type="bot.create",
+            session_id=session_id,
+            mirako_session_id=mirako_session_id,
+            recall_bot_id=session.recall_bot_id,
+            payload=bot,
+        )
 
         return CreateSessionResponse(
             session_id=session_id,
@@ -153,6 +166,13 @@ class SessionService:
             if session is None:
                 logger.warning("recall transcript webhook unknown session payload=%s", payload)
                 return {"ok": True, "ignored": True, "reason": "unknown_session"}
+            recall_store.add_event(
+                event_type=event,
+                session_id=session.session_id,
+                mirako_session_id=session.mirako_session_id,
+                recall_bot_id=session.recall_bot_id,
+                payload=payload,
+            )
 
             transcript_data = ((payload.get("data") or {}).get("data") or {})
             words = transcript_data.get("words") or []
@@ -172,7 +192,21 @@ class SessionService:
                 "words": words,
             }
             session.transcript_utterances.append(utterance)
-            await self._insert_metis_memory(session, content=content, speaker=speaker, participant=participant, payload=payload)
+            start_time, end_time = self._transcript_time_range(transcript_data, words)
+            recall_store.add_meeting_record(
+                session_id=session.session_id,
+                mirako_session_id=session.mirako_session_id,
+                recall_bot_id=session.recall_bot_id,
+                speaker=speaker,
+                content=content,
+                start_time=start_time,
+                end_time=end_time,
+                participant=participant,
+                words=words,
+                language_code=transcript_data.get("language_code"),
+                source_event=event,
+                payload=payload,
+            )
             logger.info(
                 "recall transcript stored session_id=%s speaker=%s words=%s chars=%s",
                 session.session_id,
@@ -196,6 +230,13 @@ class SessionService:
             if session is None:
                 logger.warning("recall participant webhook unknown session payload=%s", payload)
                 return {"ok": True, "ignored": True, "reason": "unknown_session"}
+            recall_store.add_event(
+                event_type=event,
+                session_id=session.session_id,
+                mirako_session_id=session.mirako_session_id,
+                recall_bot_id=session.recall_bot_id,
+                payload=payload,
+            )
 
             participant = (((payload.get("data") or {}).get("data") or {}).get("participant") or {})
             participant_id = self._participant_key(participant)
@@ -237,8 +278,8 @@ class SessionService:
                 mode_changed,
             )
             if mode_changed:
-                await self._set_metis_conversation_mode(session, desired_mode)
                 session.conversation_mode = desired_mode
+                await self._set_gateway_conversation_mode(session, desired_mode)
 
             return {
                 "ok": True,
@@ -261,8 +302,21 @@ class SessionService:
                 logger.info("leaving recall bot session_id=%s recall_bot_id=%s", session_id, session.recall_bot_id)
                 recall_response = await self._recall_client().leave_call(session.recall_bot_id)
                 recall_left = True
+                recall_store.add_event(
+                    event_type="bot.leave_call",
+                    session_id=session.session_id,
+                    mirako_session_id=session.mirako_session_id,
+                    recall_bot_id=session.recall_bot_id,
+                    payload=recall_response,
+                )
             except Exception as exc:
                 raise SessionServiceError(502, self._http_error_detail(exc, service="recall"))
+        recall_store.upsert_session(
+            session_id=session.session_id,
+            mirako_session_id=session.mirako_session_id,
+            recall_bot_id=session.recall_bot_id,
+            closed_at=time.time(),
+        )
 
         gateway_response = None
         gateway_stopped = False
@@ -388,6 +442,24 @@ class SessionService:
             except ValueError:
                 return {"status_code": response.status_code, "response": response.text}
 
+    async def _set_gateway_conversation_mode(self, session: Session, mode: str) -> None:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.post(
+                f"{session.gateway_url}/api/sessions/{session.mirako_session_id}/mode",
+                headers={"Accept": "application/json", "Content-Type": "application/json"},
+                json={"mode": mode},
+            )
+            if response.status_code >= 400:
+                logger.error(
+                    "gateway conversation mode failed session_id=%s gateway_session_id=%s mode=%s status_code=%s response=%s",
+                    session.session_id,
+                    session.mirako_session_id,
+                    mode,
+                    response.status_code,
+                    response.text,
+                )
+            response.raise_for_status()
+
     def _recall_recording_config(self, req: CreateSessionRequest, bridge_url: str) -> dict[str, Any] | None:
         if not self.settings.recall_transcript_enabled:
             return None
@@ -436,6 +508,49 @@ class SessionService:
             return f"name:{name}"
         return ""
 
+    def _transcript_time_range(
+        self,
+        transcript_data: dict[str, Any],
+        words: list[Any],
+    ) -> tuple[float | None, float | None]:
+        start_time = self._first_number(
+            transcript_data,
+            ("start_time", "start_timestamp", "start", "timestamp", "audio_start_time"),
+        )
+        end_time = self._first_number(
+            transcript_data,
+            ("end_time", "end_timestamp", "end", "audio_end_time"),
+        )
+        word_starts: list[float] = []
+        word_ends: list[float] = []
+        for word in words:
+            if not isinstance(word, dict):
+                continue
+            word_start = self._first_number(word, ("start_time", "start_timestamp", "start", "timestamp"))
+            word_end = self._first_number(word, ("end_time", "end_timestamp", "end"))
+            if word_start is not None:
+                word_starts.append(word_start)
+            if word_end is not None:
+                word_ends.append(word_end)
+        if start_time is None and word_starts:
+            start_time = min(word_starts)
+        if end_time is None and word_ends:
+            end_time = max(word_ends)
+        return start_time, end_time
+
+    @staticmethod
+    def _first_number(data: dict[str, Any], keys: tuple[str, ...]) -> float | None:
+        for key in keys:
+            value = data.get(key)
+            if isinstance(value, int | float):
+                return float(value)
+            if isinstance(value, str):
+                try:
+                    return float(value)
+                except ValueError:
+                    continue
+        return None
+
     def _initial_conversation_mode(self) -> str:
         policy = self.settings.conversation_mode_policy
         if policy in {"multi", "single"}:
@@ -447,37 +562,6 @@ class SessionService:
         if policy in {"multi", "single"}:
             return None
         return "multi" if participant_count > 2 else "single"
-
-    async def _set_metis_conversation_mode(self, session: Session, mode: str, include_session_id: bool = True) -> None:
-        base_url = self.settings.metis_control_base_url.rstrip("/")
-        if not base_url:
-            logger.warning("metis conversation mode skipped because METIS_CONTROL_BASE_URL is empty")
-            return
-
-        body = {"mode": mode}
-        if include_session_id:
-            body["session_id"] = session.mirako_session_id
-        headers = {"Accept": "application/json", "Content-Type": "application/json"}
-        if self.settings.metis_control_api_key:
-            headers["Authorization"] = f"Bearer {self.settings.metis_control_api_key}"
-        async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.post(f"{base_url}/session/mode", headers=headers, json=body)
-            if response.status_code >= 400:
-                logger.error(
-                    "metis conversation mode failed session_id=%s mode=%s status_code=%s response=%s",
-                    session.session_id,
-                    mode,
-                    response.status_code,
-                    response.text,
-                )
-            response.raise_for_status()
-            logger.info(
-                "metis conversation mode set session_id=%s mirako_session_id=%s mode=%s participant_count=%s",
-                session.session_id,
-                session.mirako_session_id,
-                mode,
-                session.meeting_participant_count,
-            )
 
     def _session_from_recall_payload(self, payload: dict[str, Any]) -> Session | None:
         data = payload.get("data") or {}
@@ -492,54 +576,6 @@ class SessionService:
         if bot_id:
             return self.get_session_by_recall_bot_id(str(bot_id))
         return None
-
-    async def _insert_metis_memory(
-        self,
-        session: Session,
-        *,
-        content: str,
-        speaker: str,
-        participant: dict[str, Any],
-        payload: dict[str, Any],
-    ) -> None:
-        base_url = self.settings.metis_memory_base_url.rstrip("/")
-        path = self.settings.metis_memory_insert_path
-        if not base_url or not path:
-            logger.info("metis memory skipped because METIS_MEMORY_BASE_URL or METIS_MEMORY_INSERT_PATH is empty")
-            return
-
-        body = {
-            "session_id": session.mirako_session_id,
-            "content": content,
-            "user": session.memory_user,
-            "speaker": speaker,
-            "role": "meeting_note",
-            "source": "recall.ai",
-            "metadata": {
-                "topic": "meeting",
-                "importance": "high",
-                "recall_session_id": session.session_id,
-                "recall_bot_id": session.recall_bot_id,
-                "participant": participant,
-                "event": payload.get("event"),
-            },
-        }
-        headers = {"Accept": "application/json", "Content-Type": "application/json"}
-        if self.settings.metis_memory_api_key:
-            headers["Authorization"] = f"Bearer {self.settings.metis_memory_api_key}"
-        async with httpx.AsyncClient(timeout=15) as client:
-            try:
-                response = await client.post(
-                    f"{base_url}{path}",
-                    headers=headers,
-                    json=body,
-                )
-            except httpx.HTTPError as exc:
-                logger.error("metis memory insert request failed base_url=%s path=%s error=%s", base_url, path, exc)
-                return
-            if response.status_code >= 400:
-                logger.error("metis memory insert failed status_code=%s response=%s", response.status_code, response.text)
-                return
 
     async def _best_effort_leave_recall_bot(self, bot_id: str) -> None:
         try:

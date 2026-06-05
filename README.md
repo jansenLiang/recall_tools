@@ -41,7 +41,7 @@ Zoom Meeting <-------------------------------+
   v                                           |
 Recall bot output-media browser              |
   | getUserMedia({ audio: true })             |
-  | WebRTC audio track + VAD events           |
+  | WS PCM16 audio chunks + VAD events        |
   v                                           |
 live-stream-gateway                          |
   | api_key = mirako_session_id               |
@@ -77,7 +77,7 @@ Video mode:
 ```text
 Zoom participant audio
   -> Recall output-media browser getUserMedia({ audio: true })
-  -> bridge WebRTC audio track
+  -> bridge WebSocket PCM16 chunks
   -> live-stream-gateway
 
 live-stream-gateway audio/video
@@ -92,7 +92,7 @@ Audio mode:
 ```text
 Zoom participant audio
   -> Recall output-media browser getUserMedia({ audio: true })
-  -> bridge WebRTC audio track
+  -> bridge WebSocket PCM16 chunks
   -> live-stream-gateway
 
 live-stream-gateway audio only
@@ -113,6 +113,7 @@ Only the business APIs are included in the generated docs. `/bridge/{session_id}
 
 - `POST /api/sessions`
 - `POST /api/sessions/{session_id}/close`
+- `GET /api/meeting-records`
 
 ### Create Session
 
@@ -158,6 +159,31 @@ Closing a session performs these actions:
 - Ask the Recall bot to leave the meeting.
 - Call `LIVE_STREAM_GATEWAY_URL/api/sessions/{mirako_session_id}/stop` to stop the gateway session.
 - End the Zoom meeting if it was created by this service.
+
+### Get Meeting Records
+
+Recall.ai transcript webhooks are stored as meeting records in SQLite at `RECALL_DATA_DB_PATH`, which defaults to `data/recall_tools.sqlite3`.
+
+```bash
+curl 'http://localhost:8000/api/meeting-records?session_id=recall-tools-session-id' \
+  -H 'x-api-key: your_service_api_key'
+```
+
+You can also query by the Mirako session id:
+
+```bash
+curl 'http://localhost:8000/api/meeting-records?mirako_session_id=mirako-session-id' \
+  -H 'x-api-key: your_service_api_key'
+```
+
+Pagination is optional. If `limit` is omitted, all matching records are returned.
+
+```bash
+curl 'http://localhost:8000/api/meeting-records?mirako_session_id=mirako-session-id&limit=50&offset=0' \
+  -H 'x-api-key: your_service_api_key'
+```
+
+Each record contains the speaker, content, participant metadata, word-level payload when available, and start/end time fields extracted from Recall.ai transcript payloads.
 
 ## Local Development
 

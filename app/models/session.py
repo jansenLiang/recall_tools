@@ -16,7 +16,6 @@ class Session:
     bridge_url: str
     recall_bot_id: str
     recall_bot: dict[str, Any]
-    memory_user: str
     transcript_utterances: list[dict[str, Any]]
     meeting_participants: dict[str, dict[str, Any]]
     meeting_participant_count: int

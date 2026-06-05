@@ -8,12 +8,14 @@ import logging
 import re
 import secrets
 
-from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse
 
 from app.core.config import settings
 from app.core.paths import STATIC_DIR
-from app.schemas.sessions import BridgeTelemetryRequest, CloseSessionResponse, CreateSessionRequest, CreateSessionResponse
+from app.schemas.sessions import BridgeTelemetryRequest, CloseSessionResponse, CreateSessionRequest, CreateSessionResponse, MeetingRecordsResponse
+from app.services.recall_store import recall_store
 from app.services.session_service import SessionServiceError, session_service
 
 
@@ -172,6 +174,29 @@ async def close_session(
         raise HTTPException(status_code=exc.status_code, detail=exc.detail)
 
 
+@router.get(
+    "/api/meeting-records",
+    response_model=MeetingRecordsResponse,
+    summary="Get meeting records",
+    description="Get transcript meeting records captured from Recall.ai webhooks. Supports optional pagination; without limit it returns all matching records.",
+)
+async def get_meeting_records(
+    session_id: str | None = Query(default=None, min_length=1),
+    mirako_session_id: str | None = Query(default=None, min_length=1),
+    limit: int | None = Query(default=None, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+    x_api_key: str | None = Header(default=None, alias="x-api-key"),
+) -> MeetingRecordsResponse:
+    verify_api_key(x_api_key)
+    data = recall_store.get_meeting_records(
+        session_id=session_id,
+        mirako_session_id=mirako_session_id,
+        limit=limit,
+        offset=offset,
+    )
+    return MeetingRecordsResponse(**data)
+
+
 @router.post("/api/bridge-telemetry", include_in_schema=False)
 async def bridge_telemetry(req: BridgeTelemetryRequest) -> dict[str, bool]:
     session = session_service.get_session(req.session_id)
@@ -187,11 +212,6 @@ async def bridge_telemetry(req: BridgeTelemetryRequest) -> dict[str, bool]:
         req.elapsed_ms,
         json.dumps(req.payload or {}, ensure_ascii=True, sort_keys=True),
     )
-    if req.event == "gateway-session-create-success" and known_session:
-        try:
-            await session_service.apply_conversation_mode(req.session_id, req.gateway_session_id)
-        except Exception:
-            logger.exception("bridge conversation mode apply failed session_id=%s", req.session_id)
     return {"ok": True}
 
 
@@ -266,3 +286,12 @@ async def bridge(session_id: str) -> HTMLResponse:
         "conversationMode": session.conversation_mode,
     }
     return HTMLResponse(html.replace("__BRIDGE_CONFIG__", json.dumps(bridge_config)))
+
+
+@router.get("/static/dd.mp3", include_in_schema=False)
+async def dd_audio() -> FileResponse:
+    return FileResponse(
+        STATIC_DIR / "dd.mp3",
+        media_type="audio/mpeg",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )

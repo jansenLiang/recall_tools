@@ -25,13 +25,7 @@ class CreateSessionRequest(BaseModel):
         min_length=8,
         description="Existing meeting URL for meeting_provider. If omitted, the zoom strategy creates a Zoom meeting.",
     )
-    public_base_url: str | None = Field(
-        default=None,
-        description="Public HTTPS base URL for this service. Defaults to PUBLIC_BASE_URL.",
-    )
     bot_name: str | None = Field(default=None, min_length=1, max_length=100)
-    zoom_topic: str | None = None
-    zoom_duration_minutes: int | None = Field(default=None, ge=1, le=1440)
 
 
 class CreateSessionResponse(BaseModel):

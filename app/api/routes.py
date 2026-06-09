@@ -271,6 +271,36 @@ async def recall_participant_events_webhook(
     return {"ok": True}
 
 
+@router.post("/api/recall/bot-status", include_in_schema=False)
+async def recall_bot_status_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> dict[str, bool]:
+    raw_body = await request.body()
+    headers = {key.lower(): value for key, value in request.headers.items()}
+    verify_recall_webhook(headers, raw_body)
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except ValueError:
+        recall_webhook_logger.warning(
+            "recall bot status invalid json headers=%s body=%s",
+            json.dumps(_safe_headers(headers), ensure_ascii=True, sort_keys=True),
+            _safe_body_preview(raw_body),
+        )
+        raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+    bot = ((payload.get("data") or {}).get("bot") or {})
+    metadata = bot.get("metadata") or {}
+    recall_webhook_logger.info(
+        "recall bot status payload event=%s session_id=%s mirako_session_id=%s bot_id=%s",
+        payload.get("event"),
+        metadata.get("session_id"),
+        metadata.get("mirako_session_id"),
+        bot.get("id"),
+    )
+    background_tasks.add_task(session_service.handle_recall_bot_status, payload)
+    return {"ok": True}
+
+
 @router.get("/bridge/{session_id}", response_class=HTMLResponse, include_in_schema=False)
 async def bridge(session_id: str) -> HTMLResponse:
     session = session_service.get_session(session_id)

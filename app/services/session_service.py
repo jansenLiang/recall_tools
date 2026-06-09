@@ -43,7 +43,7 @@ class SessionService:
         mirako_session_id = req.mirako_session_id
         gateway_url = self._normalize_gateway_url(None)
 
-        public_base_url = self._normalize_public_base_url(req.public_base_url)
+        public_base_url = self._normalize_public_base_url()
         session_id = secrets.token_urlsafe(24)
         bridge_url = f"{public_base_url}/bridge/{session_id}"
 
@@ -290,6 +290,63 @@ class SessionService:
             logger.exception("recall participant event processing failed")
             return {"ok": False}
 
+    async def handle_recall_bot_status(self, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            event = str(payload.get("event") or "")
+            if event not in {"bot.call_ended", "bot.done", "bot.fatal"}:
+                logger.info("recall bot status webhook ignored event=%s", event)
+                return {"ok": True, "ignored": True}
+
+            session = self._session_from_recall_payload(payload)
+            if session is None:
+                logger.warning("recall bot status webhook unknown session event=%s payload=%s", event, payload)
+                return {"ok": True, "ignored": True, "reason": "unknown_session"}
+
+            recall_store.add_event(
+                event_type=event,
+                session_id=session.session_id,
+                mirako_session_id=session.mirako_session_id,
+                recall_bot_id=session.recall_bot_id,
+                payload=payload,
+            )
+
+            removed = self.sessions.pop(session.session_id, None)
+            if removed is None:
+                logger.info(
+                    "recall bot terminal event for already removed session_id=%s event=%s",
+                    session.session_id,
+                    event,
+                )
+            recall_store.upsert_session(
+                session_id=session.session_id,
+                mirako_session_id=session.mirako_session_id,
+                recall_bot_id=session.recall_bot_id,
+                closed_at=time.time(),
+            )
+
+            gateway_stopped = False
+            try:
+                logger.info(
+                    "recall bot terminal event stopping gateway session_id=%s mirako_session_id=%s event=%s",
+                    session.session_id,
+                    session.mirako_session_id,
+                    event,
+                )
+                await self._stop_gateway_session(session)
+                gateway_stopped = True
+            except Exception:
+                logger.exception(
+                    "recall bot terminal event failed to stop gateway session_id=%s mirako_session_id=%s event=%s",
+                    session.session_id,
+                    session.mirako_session_id,
+                    event,
+                )
+
+            return {"ok": True, "event": event, "gateway_stopped": gateway_stopped}
+        except Exception:
+            logger.exception("recall bot status processing failed")
+            return {"ok": False}
+
     async def close_session(self, session_id: str) -> CloseSessionResponse:
         session = self.sessions.pop(session_id, None)
         if session is None:
@@ -359,8 +416,8 @@ class SessionService:
             zoom_response=zoom_response,
         )
 
-    def _normalize_public_base_url(self, value: str | None) -> str:
-        base = (value or self.settings.public_base_url).rstrip("/")
+    def _normalize_public_base_url(self) -> str:
+        base = self.settings.public_base_url.rstrip("/")
         if base.startswith("http://localhost") or base.startswith("http://127.0.0.1"):
             return base
         if not base.startswith("https://"):
@@ -490,6 +547,12 @@ class SessionService:
                         "participant_events.leave",
                         "participant_events.update",
                     ],
+                    "metadata": {"session_id": session_id, "mirako_session_id": req.mirako_session_id},
+                },
+                {
+                    "type": "webhook",
+                    "url": f"{public_base_url}/api/recall/bot-status",
+                    "events": ["bot.call_ended", "bot.done", "bot.fatal"],
                     "metadata": {"session_id": session_id, "mirako_session_id": req.mirako_session_id},
                 }
             ],

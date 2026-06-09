@@ -23,9 +23,9 @@ class ZoomMeetingStrategy:
         self.settings = settings
 
     async def create_meeting(self, req: CreateSessionRequest) -> dict[str, Any]:
-        logger.info("zoom strategy create_meeting topic=%s duration_minutes=%s", req.zoom_topic, req.zoom_duration_minutes)
-        topic = req.zoom_topic or self.settings.zoom_create_topic or "Mirako Recall Bridge"
-        duration = req.zoom_duration_minutes or self.settings.zoom_create_duration_minutes
+        topic = self.settings.zoom_create_topic or "Mirako Recall Bridge"
+        duration = self.settings.zoom_create_duration_minutes
+        logger.info("zoom strategy create_meeting topic=%s duration_minutes=%s", topic, duration)
         return await self._client().create_meeting(
             {
                 "topic": topic,

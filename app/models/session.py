@@ -19,6 +19,10 @@ class Session:
     transcript_utterances: list[dict[str, Any]]
     meeting_participants: dict[str, dict[str, Any]]
     meeting_participant_count: int
+    last_non_bot_participant_left_at: float | None
+    has_seen_non_bot_participant: bool
+    bot_only_cleanup_started: bool
     conversation_mode: str
     created_meeting: dict[str, Any] | None
     should_end_created_meeting: bool
+    gateway_stopped: bool = False

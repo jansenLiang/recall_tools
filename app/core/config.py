@@ -55,6 +55,11 @@ class Settings:
         self.recall_transcript_enabled = env("RECALL_TRANSCRIPT_ENABLED", "true").lower() in {"1", "true", "yes"}
         self.recall_transcript_language_code = env("RECALL_TRANSCRIPT_LANGUAGE_CODE", "en")
         self.recall_transcript_mode = env("RECALL_TRANSCRIPT_MODE", "prioritize_low_latency")
+        self.recall_everyone_left_timeout_seconds = env_int("RECALL_EVERYONE_LEFT_TIMEOUT_SECONDS", 300)
+        self.recall_everyone_left_activate_after_seconds = env_int("RECALL_EVERYONE_LEFT_ACTIVATE_AFTER_SECONDS", 1)
+        self.bot_only_cleanup_enabled = env("BOT_ONLY_CLEANUP_ENABLED", "true").lower() in {"1", "true", "yes"}
+        self.bot_only_cleanup_seconds = env_int("BOT_ONLY_CLEANUP_SECONDS", 300)
+        self.bot_only_cleanup_interval_seconds = env_int("BOT_ONLY_CLEANUP_INTERVAL_SECONDS", 30)
 
         self.conversation_mode_policy = env("CONVERSATION_MODE_POLICY", "auto").strip().lower()
         if self.conversation_mode_policy not in {"auto", "multi", "single"}:

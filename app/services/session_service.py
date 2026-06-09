@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import logging
 import secrets
 import time
-import logging
 from typing import Any
 
 import httpx
@@ -10,7 +10,11 @@ import httpx
 from app.clients.recall import RecallClient
 from app.core.config import Settings, settings
 from app.models.session import Session
-from app.schemas.sessions import CloseSessionResponse, CreateSessionRequest, CreateSessionResponse
+from app.schemas.sessions import (
+    CloseSessionResponse,
+    CreateSessionRequest,
+    CreateSessionResponse,
+)
 from app.services.meeting_strategies import get_meeting_strategy
 from app.services.recall_store import recall_store
 
@@ -60,7 +64,10 @@ class SessionService:
             if not meeting_url:
                 raise SessionServiceError(
                     502,
-                    {"error": f"{req.meeting_provider}_join_url_missing", req.meeting_provider: created_meeting},
+                    {
+                        "error": f"{req.meeting_provider}_join_url_missing",
+                        req.meeting_provider: created_meeting,
+                    },
                 )
             logger.info(
                 "meeting created provider=%s meeting_id=%s mirako_session_id=%s",
@@ -90,6 +97,9 @@ class SessionService:
             transcript_utterances=[],
             meeting_participants={},
             meeting_participant_count=0,
+            last_non_bot_participant_left_at=None,
+            has_seen_non_bot_participant=False,
+            bot_only_cleanup_started=False,
             conversation_mode=initial_conversation_mode,
             created_meeting=created_meeting,
             should_end_created_meeting=bool(created_meeting),
@@ -115,11 +125,18 @@ class SessionService:
         )
 
         try:
-            bot = await self._create_recall_bot(req, meeting_url=meeting_url, bridge_url=bridge_url)
+            bot = await self._create_recall_bot(
+                req, meeting_url=meeting_url, bridge_url=bridge_url
+            )
         except SessionServiceError:
             self.sessions.pop(session_id, None)
-            await self._best_effort_end_created_meeting(req.meeting_provider, created_meeting)
-            logger.warning("session rolled back after recall bot creation failure session_id=%s", session_id)
+            await self._best_effort_end_created_meeting(
+                req.meeting_provider, created_meeting
+            )
+            logger.warning(
+                "session rolled back after recall bot creation failure session_id=%s",
+                session_id,
+            )
             raise
 
         session = self.sessions[session_id]
@@ -127,8 +144,12 @@ class SessionService:
         session.recall_bot_id = str(bot.get("id") or bot.get("bot_id") or "")
         if not session.recall_bot_id:
             self.sessions.pop(session_id, None)
-            await self._best_effort_end_created_meeting(req.meeting_provider, created_meeting)
-            raise SessionServiceError(502, {"error": "recall_bot_id_missing", "bot": bot})
+            await self._best_effort_end_created_meeting(
+                req.meeting_provider, created_meeting
+            )
+            raise SessionServiceError(
+                502, {"error": "recall_bot_id_missing", "bot": bot}
+            )
         recall_store.upsert_session(
             session_id=session_id,
             mirako_session_id=mirako_session_id,
@@ -164,7 +185,9 @@ class SessionService:
 
             session = self._session_from_recall_payload(payload)
             if session is None:
-                logger.warning("recall transcript webhook unknown session payload=%s", payload)
+                logger.warning(
+                    "recall transcript webhook unknown session payload=%s", payload
+                )
                 return {"ok": True, "ignored": True, "reason": "unknown_session"}
             recall_store.add_event(
                 event_type=event,
@@ -174,14 +197,23 @@ class SessionService:
                 payload=payload,
             )
 
-            transcript_data = ((payload.get("data") or {}).get("data") or {})
+            transcript_data = (payload.get("data") or {}).get("data") or {}
             words = transcript_data.get("words") or []
-            content = " ".join(str(word.get("text") or "").strip() for word in words if isinstance(word, dict)).strip()
+            content = " ".join(
+                str(word.get("text") or "").strip()
+                for word in words
+                if isinstance(word, dict)
+            ).strip()
             if not content:
                 return {"ok": True, "ignored": True, "reason": "empty_content"}
 
             participant = transcript_data.get("participant") or {}
-            speaker = str(participant.get("name") or participant.get("email") or participant.get("id") or "default")
+            speaker = str(
+                participant.get("name")
+                or participant.get("email")
+                or participant.get("id")
+                or "default"
+            )
             utterance = {
                 "session_id": session.session_id,
                 "mirako_session_id": session.mirako_session_id,
@@ -219,16 +251,24 @@ class SessionService:
             logger.exception("recall transcript processing failed")
             return {"ok": False}
 
-    async def handle_recall_participant_event(self, payload: dict[str, Any]) -> dict[str, Any]:
+    async def handle_recall_participant_event(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
         try:
             event = str(payload.get("event") or "")
-            if event not in {"participant_events.join", "participant_events.leave", "participant_events.update"}:
+            if event not in {
+                "participant_events.join",
+                "participant_events.leave",
+                "participant_events.update",
+            }:
                 logger.info("recall participant webhook ignored event=%s", event)
                 return {"ok": True, "ignored": True}
 
             session = self._session_from_recall_payload(payload)
             if session is None:
-                logger.warning("recall participant webhook unknown session payload=%s", payload)
+                logger.warning(
+                    "recall participant webhook unknown session payload=%s", payload
+                )
                 return {"ok": True, "ignored": True, "reason": "unknown_session"}
             recall_store.add_event(
                 event_type=event,
@@ -238,10 +278,16 @@ class SessionService:
                 payload=payload,
             )
 
-            participant = (((payload.get("data") or {}).get("data") or {}).get("participant") or {})
+            participant = ((payload.get("data") or {}).get("data") or {}).get(
+                "participant"
+            ) or {}
             participant_id = self._participant_key(participant)
             if not participant_id:
-                logger.warning("recall participant webhook missing participant id event=%s payload=%s", event, payload)
+                logger.warning(
+                    "recall participant webhook missing participant id event=%s payload=%s",
+                    event,
+                    payload,
+                )
                 return {"ok": True, "ignored": True, "reason": "missing_participant_id"}
 
             if event == "participant_events.leave":
@@ -249,8 +295,18 @@ class SessionService:
             else:
                 session.meeting_participants[participant_id] = participant
 
-            session.meeting_participant_count = len(session.meeting_participants)
-            desired_mode = self._desired_conversation_mode(session.meeting_participant_count)
+            self._refresh_participant_state(session)
+            desired_mode = self._desired_conversation_mode(
+                session.meeting_participant_count
+            )
+            if (
+                event == "participant_events.leave"
+                and session.meeting_participant_count == 0
+            ):
+                await self._best_effort_stop_gateway_session(
+                    session, reason="all_participants_left"
+                )
+
             if desired_mode is None:
                 logger.info(
                     "participant event processed without mode switch session_id=%s event=%s participant_id=%s count=%s policy=%s current_mode=%s",
@@ -299,7 +355,11 @@ class SessionService:
 
             session = self._session_from_recall_payload(payload)
             if session is None:
-                logger.warning("recall bot status webhook unknown session event=%s payload=%s", event, payload)
+                logger.warning(
+                    "recall bot status webhook unknown session event=%s payload=%s",
+                    event,
+                    payload,
+                )
                 return {"ok": True, "ignored": True, "reason": "unknown_session"}
 
             recall_store.add_event(
@@ -334,6 +394,7 @@ class SessionService:
                 )
                 await self._stop_gateway_session(session)
                 gateway_stopped = True
+                session.gateway_stopped = True
             except Exception:
                 logger.exception(
                     "recall bot terminal event failed to stop gateway session_id=%s mirako_session_id=%s event=%s",
@@ -356,8 +417,14 @@ class SessionService:
         recall_left = False
         if session.recall_bot_id:
             try:
-                logger.info("leaving recall bot session_id=%s recall_bot_id=%s", session_id, session.recall_bot_id)
-                recall_response = await self._recall_client().leave_call(session.recall_bot_id)
+                logger.info(
+                    "leaving recall bot session_id=%s recall_bot_id=%s",
+                    session_id,
+                    session.recall_bot_id,
+                )
+                recall_response = await self._recall_client().leave_call(
+                    session.recall_bot_id
+                )
                 recall_left = True
                 recall_store.add_event(
                     event_type="bot.leave_call",
@@ -367,7 +434,9 @@ class SessionService:
                     payload=recall_response,
                 )
             except Exception as exc:
-                raise SessionServiceError(502, self._http_error_detail(exc, service="recall"))
+                raise SessionServiceError(
+                    502, self._http_error_detail(exc, service="recall")
+                )
         recall_store.upsert_session(
             session_id=session.session_id,
             mirako_session_id=session.mirako_session_id,
@@ -386,8 +455,11 @@ class SessionService:
             )
             gateway_response = await self._stop_gateway_session(session)
             gateway_stopped = True
+            session.gateway_stopped = True
         except Exception as exc:
-            raise SessionServiceError(502, self._http_error_detail(exc, service="gateway"))
+            raise SessionServiceError(
+                502, self._http_error_detail(exc, service="gateway")
+            )
 
         zoom_response = None
         zoom_ended = False
@@ -401,10 +473,15 @@ class SessionService:
                         session.meeting_provider,
                         meeting_id,
                     )
-                    zoom_response = await self._meeting_strategy(session.meeting_provider).end_meeting(meeting_id)
+                    zoom_response = await self._meeting_strategy(
+                        session.meeting_provider
+                    ).end_meeting(meeting_id)
                     zoom_ended = True
                 except Exception as exc:
-                    raise SessionServiceError(502, self._http_error_detail(exc, service=session.meeting_provider))
+                    raise SessionServiceError(
+                        502,
+                        self._http_error_detail(exc, service=session.meeting_provider),
+                    )
 
         return CloseSessionResponse(
             session_id=session_id,
@@ -454,12 +531,18 @@ class SessionService:
             )
         try:
             logger.info("creating meeting provider=%s", req.meeting_provider)
-            return await self._meeting_strategy(req.meeting_provider).create_meeting(req)
+            return await self._meeting_strategy(req.meeting_provider).create_meeting(
+                req
+            )
         except Exception as exc:
             logger.exception("create meeting failed provider=%s", req.meeting_provider)
-            raise SessionServiceError(502, self._http_error_detail(exc, service=req.meeting_provider))
+            raise SessionServiceError(
+                502, self._http_error_detail(exc, service=req.meeting_provider)
+            )
 
-    async def _create_recall_bot(self, req: CreateSessionRequest, *, meeting_url: str, bridge_url: str) -> dict[str, Any]:
+    async def _create_recall_bot(
+        self, req: CreateSessionRequest, *, meeting_url: str, bridge_url: str
+    ) -> dict[str, Any]:
         try:
             logger.info(
                 "creating recall bot provider=%s mode=%s bridge_url=%s",
@@ -472,26 +555,49 @@ class SessionService:
                 bot_name=req.bot_name or self.settings.bot_name,
                 variant=self.settings.recall_bot_variant,
                 output_media_url=bridge_url,
-                metadata={"session_id": bridge_url.rsplit("/", 1)[-1], "mirako_session_id": req.mirako_session_id},
+                metadata={
+                    "session_id": bridge_url.rsplit("/", 1)[-1],
+                    "mirako_session_id": req.mirako_session_id,
+                },
                 recording_config=self._recall_recording_config(req, bridge_url),
+                automatic_leave=self._recall_automatic_leave_config(),
             )
         except httpx.HTTPStatusError as exc:
-            logger.exception("recall bot creation failed status_code=%s", exc.response.status_code)
-            raise SessionServiceError(exc.response.status_code, self._http_error_detail(exc, service="recall"))
+            logger.exception(
+                "recall bot creation failed status_code=%s", exc.response.status_code
+            )
+            raise SessionServiceError(
+                exc.response.status_code, self._http_error_detail(exc, service="recall")
+            )
         except Exception as exc:
             logger.exception("recall bot creation failed")
-            raise SessionServiceError(502, self._http_error_detail(exc, service="recall"))
+            raise SessionServiceError(
+                502, self._http_error_detail(exc, service="recall")
+            )
 
     async def _stop_gateway_session(self, session: Session) -> dict[str, Any] | None:
+        if session.gateway_stopped:
+            return {
+                "status_code": 200,
+                "message": "Gateway session was already stopped by recall_tools.",
+            }
         async with httpx.AsyncClient(timeout=15) as client:
             response = await client.post(
                 f"{session.gateway_url}/api/sessions/{session.mirako_session_id}/stop",
                 headers={"Accept": "application/json"},
             )
             if response.status_code == 404:
-                logger.warning("gateway session not found mirako_session_id=%s", session.mirako_session_id)
-                return {"status_code": 404, "message": "Gateway session was already stopped or not found."}
+                logger.warning(
+                    "gateway session not found mirako_session_id=%s",
+                    session.mirako_session_id,
+                )
+                session.gateway_stopped = True
+                return {
+                    "status_code": 404,
+                    "message": "Gateway session was already stopped or not found.",
+                }
             response.raise_for_status()
+            session.gateway_stopped = True
             if not response.content:
                 return None
             try:
@@ -503,7 +609,10 @@ class SessionService:
         async with httpx.AsyncClient(timeout=10) as client:
             response = await client.post(
                 f"{session.gateway_url}/api/sessions/{session.mirako_session_id}/mode",
-                headers={"Accept": "application/json", "Content-Type": "application/json"},
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                },
                 json={"mode": mode},
             )
             if response.status_code >= 400:
@@ -517,7 +626,9 @@ class SessionService:
                 )
             response.raise_for_status()
 
-    def _recall_recording_config(self, req: CreateSessionRequest, bridge_url: str) -> dict[str, Any] | None:
+    def _recall_recording_config(
+        self, req: CreateSessionRequest, bridge_url: str
+    ) -> dict[str, Any] | None:
         if not self.settings.recall_transcript_enabled:
             return None
         public_base_url = bridge_url.rsplit("/bridge/", 1)[0]
@@ -537,7 +648,10 @@ class SessionService:
                     "type": "webhook",
                     "url": f"{public_base_url}/api/recall/transcript",
                     "events": ["transcript.data"],
-                    "metadata": {"session_id": session_id, "mirako_session_id": req.mirako_session_id},
+                    "metadata": {
+                        "session_id": session_id,
+                        "mirako_session_id": req.mirako_session_id,
+                    },
                 },
                 {
                     "type": "webhook",
@@ -547,16 +661,90 @@ class SessionService:
                         "participant_events.leave",
                         "participant_events.update",
                     ],
-                    "metadata": {"session_id": session_id, "mirako_session_id": req.mirako_session_id},
+                    "metadata": {
+                        "session_id": session_id,
+                        "mirako_session_id": req.mirako_session_id,
+                    },
                 },
-                {
-                    "type": "webhook",
-                    "url": f"{public_base_url}/api/recall/bot-status",
-                    "events": ["bot.call_ended", "bot.done", "bot.fatal"],
-                    "metadata": {"session_id": session_id, "mirako_session_id": req.mirako_session_id},
-                }
             ],
         }
+
+    def _recall_automatic_leave_config(self) -> dict[str, Any]:
+        return {
+            "everyone_left_timeout": {
+                "timeout": max(1, self.settings.recall_everyone_left_timeout_seconds),
+                "activate_after": max(
+                    1, self.settings.recall_everyone_left_activate_after_seconds
+                ),
+            }
+        }
+
+    def _refresh_participant_state(self, session: Session) -> None:
+        non_bot_participants = {
+            key: participant
+            for key, participant in session.meeting_participants.items()
+            if not self._is_recall_bot_participant(participant)
+        }
+        session.meeting_participant_count = len(non_bot_participants)
+        now = time.time()
+        if session.meeting_participant_count > 0:
+            session.has_seen_non_bot_participant = True
+            session.last_non_bot_participant_left_at = None
+            session.bot_only_cleanup_started = False
+        elif session.has_seen_non_bot_participant and session.last_non_bot_participant_left_at is None:
+            session.last_non_bot_participant_left_at = now
+
+    def _is_recall_bot_participant(self, participant: dict[str, Any]) -> bool:
+        name = str(participant.get("name") or "").strip().lower()
+        bot_name = self.settings.bot_name.strip().lower()
+        return bool(bot_name and name == bot_name)
+
+    async def cleanup_bot_only_sessions(self) -> None:
+        if not self.settings.bot_only_cleanup_enabled:
+            return
+        now = time.time()
+        timeout = max(1, self.settings.bot_only_cleanup_seconds)
+        sessions = list(self.sessions.values())
+        for session in sessions:
+            self._refresh_participant_state(session)
+            if session.gateway_stopped or session.bot_only_cleanup_started:
+                continue
+            if not session.has_seen_non_bot_participant:
+                continue
+            left_at = session.last_non_bot_participant_left_at
+            if left_at is None or now - left_at < timeout:
+                continue
+            session.bot_only_cleanup_started = True
+            logger.warning(
+                "bot-only cleanup triggered session_id=%s mirako_session_id=%s recall_bot_id=%s idle_seconds=%.1f participant_count=%s",
+                session.session_id,
+                session.mirako_session_id,
+                session.recall_bot_id,
+                now - left_at,
+                session.meeting_participant_count,
+            )
+            recall_store.add_event(
+                event_type="bot_only_cleanup",
+                session_id=session.session_id,
+                mirako_session_id=session.mirako_session_id,
+                recall_bot_id=session.recall_bot_id,
+                payload={
+                    "reason": "bot_only_timeout",
+                    "timeout_seconds": timeout,
+                    "participant_count": session.meeting_participant_count,
+                },
+            )
+            await self._best_effort_leave_recall_bot(session.recall_bot_id)
+            await self._best_effort_stop_gateway_session(
+                session, reason="bot_only_timeout"
+            )
+            self.sessions.pop(session.session_id, None)
+            recall_store.upsert_session(
+                session_id=session.session_id,
+                mirako_session_id=session.mirako_session_id,
+                recall_bot_id=session.recall_bot_id,
+                closed_at=time.time(),
+            )
 
     @staticmethod
     def _participant_key(participant: dict[str, Any]) -> str:
@@ -589,7 +777,9 @@ class SessionService:
         for word in words:
             if not isinstance(word, dict):
                 continue
-            word_start = self._first_number(word, ("start_time", "start_timestamp", "start", "timestamp"))
+            word_start = self._first_number(
+                word, ("start_time", "start_timestamp", "start", "timestamp")
+            )
             word_end = self._first_number(word, ("end_time", "end_timestamp", "end"))
             if word_start is not None:
                 word_starts.append(word_start)
@@ -630,7 +820,9 @@ class SessionService:
         data = payload.get("data") or {}
         realtime_endpoint = data.get("realtime_endpoint") or {}
         bot = data.get("bot") or {}
-        session_id = (realtime_endpoint.get("metadata") or {}).get("session_id") or (bot.get("metadata") or {}).get("session_id")
+        session_id = (realtime_endpoint.get("metadata") or {}).get("session_id") or (
+            bot.get("metadata") or {}
+        ).get("session_id")
         if session_id:
             session = self.get_session(str(session_id))
             if session is not None:
@@ -646,7 +838,30 @@ class SessionService:
         except Exception:
             pass
 
-    async def _best_effort_end_created_meeting(self, provider: str, created_meeting: dict[str, Any] | None) -> None:
+    async def _best_effort_stop_gateway_session(
+        self, session: Session, *, reason: str
+    ) -> None:
+        if session.gateway_stopped:
+            return
+        try:
+            logger.info(
+                "stopping gateway from recall webhook session_id=%s mirako_session_id=%s reason=%s",
+                session.session_id,
+                session.mirako_session_id,
+                reason,
+            )
+            await self._stop_gateway_session(session)
+        except Exception:
+            logger.exception(
+                "best-effort gateway stop failed session_id=%s mirako_session_id=%s reason=%s",
+                session.session_id,
+                session.mirako_session_id,
+                reason,
+            )
+
+    async def _best_effort_end_created_meeting(
+        self, provider: str, created_meeting: dict[str, Any] | None
+    ) -> None:
         meeting_id = (created_meeting or {}).get("id")
         if not meeting_id:
             return
@@ -656,7 +871,9 @@ class SessionService:
             pass
 
     def _recall_client(self) -> RecallClient:
-        return RecallClient(api_key=self.settings.recall_api_key, base_url=self.settings.recall_base_url)
+        return RecallClient(
+            api_key=self.settings.recall_api_key, base_url=self.settings.recall_base_url
+        )
 
     def _meeting_strategy(self, provider: str):
         return get_meeting_strategy(provider, self.settings)
@@ -664,7 +881,10 @@ class SessionService:
     @staticmethod
     def _http_error_detail(exc: Exception, *, service: str) -> dict[str, Any]:
         response = getattr(exc, "response", None)
-        detail: dict[str, Any] = {"error": f"{service}_request_failed", "message": str(exc)}
+        detail: dict[str, Any] = {
+            "error": f"{service}_request_failed",
+            "message": str(exc),
+        }
         if response is not None:
             detail["status_code"] = getattr(response, "status_code", None)
             detail["response"] = getattr(response, "text", "")

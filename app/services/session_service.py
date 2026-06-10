@@ -43,9 +43,44 @@ class SessionService:
                 return session
         return None
 
+    def get_bridge_status(self, session_id: str) -> dict[str, Any] | None:
+        session = self.get_session(session_id)
+        if session is None:
+            return None
+        return {
+            "session_id": session.session_id,
+            "mirako_session_id": session.mirako_session_id,
+            "closed": session.closed,
+            "closed_reason": session.closed_reason,
+            "closed_at": session.closed_at,
+            "gateway_stopped": session.gateway_stopped,
+            "can_connect_gateway": not session.closed,
+        }
+
     async def create_session(self, req: CreateSessionRequest) -> CreateSessionResponse:
         mirako_session_id = req.mirako_session_id
         gateway_url = self._normalize_gateway_url(None)
+        existing_for_mirako = [
+            session
+            for session in self.sessions.values()
+            if session.mirako_session_id == mirako_session_id
+        ]
+        if existing_for_mirako:
+            logger.info(
+                "create_session sees existing sessions for mirako_session_id=%s count=%s details=%s",
+                mirako_session_id,
+                len(existing_for_mirako),
+                [
+                    {
+                        "session_id": session.session_id,
+                        "closed": session.closed,
+                        "closed_reason": session.closed_reason,
+                        "gateway_stopped": session.gateway_stopped,
+                        "recall_bot_id": session.recall_bot_id,
+                    }
+                    for session in existing_for_mirako
+                ],
+            )
 
         public_base_url = self._normalize_public_base_url()
         session_id = secrets.token_urlsafe(24)
@@ -370,13 +405,7 @@ class SessionService:
                 payload=payload,
             )
 
-            removed = self.sessions.pop(session.session_id, None)
-            if removed is None:
-                logger.info(
-                    "recall bot terminal event for already removed session_id=%s event=%s",
-                    session.session_id,
-                    event,
-                )
+            self._mark_session_closed(session, reason=event)
             recall_store.upsert_session(
                 session_id=session.session_id,
                 mirako_session_id=session.mirako_session_id,
@@ -409,9 +438,10 @@ class SessionService:
             return {"ok": False}
 
     async def close_session(self, session_id: str) -> CloseSessionResponse:
-        session = self.sessions.pop(session_id, None)
+        session = self.sessions.get(session_id)
         if session is None:
             raise SessionServiceError(404, "Unknown session_id.")
+        self._mark_session_closed(session, reason="api.close_session")
 
         recall_response = None
         recall_left = False
@@ -577,14 +607,36 @@ class SessionService:
 
     async def _stop_gateway_session(self, session: Session) -> dict[str, Any] | None:
         if session.gateway_stopped:
+            logger.info(
+                "skip gateway stop; already stopped session_id=%s mirako_session_id=%s closed=%s closed_reason=%s",
+                session.session_id,
+                session.mirako_session_id,
+                session.closed,
+                session.closed_reason,
+            )
             return {
                 "status_code": 200,
                 "message": "Gateway session was already stopped by recall_tools.",
             }
         async with httpx.AsyncClient(timeout=15) as client:
+            logger.info(
+                "posting gateway stop session_id=%s mirako_session_id=%s closed=%s closed_reason=%s gateway_url=%s",
+                session.session_id,
+                session.mirako_session_id,
+                session.closed,
+                session.closed_reason,
+                session.gateway_url,
+            )
             response = await client.post(
                 f"{session.gateway_url}/api/sessions/{session.mirako_session_id}/stop",
                 headers={"Accept": "application/json"},
+            )
+            logger.info(
+                "gateway stop response session_id=%s mirako_session_id=%s status_code=%s body=%s",
+                session.session_id,
+                session.mirako_session_id,
+                response.status_code,
+                response.text[:500],
             )
             if response.status_code == 404:
                 logger.warning(
@@ -691,7 +743,10 @@ class SessionService:
             session.has_seen_non_bot_participant = True
             session.last_non_bot_participant_left_at = None
             session.bot_only_cleanup_started = False
-        elif session.has_seen_non_bot_participant and session.last_non_bot_participant_left_at is None:
+        elif (
+            session.has_seen_non_bot_participant
+            and session.last_non_bot_participant_left_at is None
+        ):
             session.last_non_bot_participant_left_at = now
 
     def _is_recall_bot_participant(self, participant: dict[str, Any]) -> bool:
@@ -809,6 +864,28 @@ class SessionService:
         if policy in {"multi", "single"}:
             return policy
         return "multi"
+
+    def _mark_session_closed(self, session: Session, *, reason: str) -> None:
+        if session.closed:
+            logger.info(
+                "session already marked closed session_id=%s mirako_session_id=%s existing_reason=%s new_reason=%s",
+                session.session_id,
+                session.mirako_session_id,
+                session.closed_reason,
+                reason,
+            )
+            return
+        session.closed = True
+        session.closed_reason = reason
+        session.closed_at = time.time()
+        logger.info(
+            "session marked closed; bridge reconnects will be blocked session_id=%s mirako_session_id=%s reason=%s gateway_stopped=%s closed_at=%s",
+            session.session_id,
+            session.mirako_session_id,
+            reason,
+            session.gateway_stopped,
+            session.closed_at,
+        )
 
     def _desired_conversation_mode(self, participant_count: int) -> str | None:
         policy = self.settings.conversation_mode_policy

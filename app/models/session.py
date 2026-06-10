@@ -26,3 +26,6 @@ class Session:
     created_meeting: dict[str, Any] | None
     should_end_created_meeting: bool
     gateway_stopped: bool = False
+    closed: bool = False
+    closed_reason: str | None = None
+    closed_at: float | None = None

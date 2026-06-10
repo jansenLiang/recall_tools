@@ -14,7 +14,13 @@ from fastapi.responses import FileResponse
 
 from app.core.config import settings
 from app.core.paths import STATIC_DIR
-from app.schemas.sessions import BridgeTelemetryRequest, CloseSessionResponse, CreateSessionRequest, CreateSessionResponse, MeetingRecordsResponse
+from app.schemas.sessions import (
+    BridgeTelemetryRequest,
+    CloseSessionResponse,
+    CreateSessionRequest,
+    CreateSessionResponse,
+    MeetingRecordsResponse,
+)
 from app.services.recall_store import recall_store
 from app.services.session_service import SessionServiceError, session_service
 
@@ -56,7 +62,9 @@ def verify_recall_webhook(headers: dict[str, str], raw_body: bytes) -> None:
         return
     secret = settings.recall_webhook_secret
     if not secret.startswith("whsec_"):
-        raise HTTPException(status_code=500, detail="RECALL_WEBHOOK_SECRET must start with whsec_.")
+        raise HTTPException(
+            status_code=500, detail="RECALL_WEBHOOK_SECRET must start with whsec_."
+        )
     msg_id = headers.get("webhook-id") or headers.get("svix-id")
     msg_timestamp = headers.get("webhook-timestamp") or headers.get("svix-timestamp")
     msg_signature = headers.get("webhook-signature") or headers.get("svix-signature")
@@ -66,13 +74,19 @@ def verify_recall_webhook(headers: dict[str, str], raw_body: bytes) -> None:
             json.dumps(_safe_headers(headers), ensure_ascii=True, sort_keys=True),
             _safe_body_preview(raw_body),
         )
-        raise HTTPException(status_code=400, detail="Missing Recall webhook signature headers.")
+        raise HTTPException(
+            status_code=400, detail="Missing Recall webhook signature headers."
+        )
 
     try:
         key = base64.b64decode(secret.removeprefix("whsec_"))
     except ValueError:
-        raise HTTPException(status_code=500, detail="RECALL_WEBHOOK_SECRET is not valid base64.")
-    signed = b".".join([msg_id.encode("utf-8"), msg_timestamp.encode("utf-8"), raw_body])
+        raise HTTPException(
+            status_code=500, detail="RECALL_WEBHOOK_SECRET is not valid base64."
+        )
+    signed = b".".join(
+        [msg_id.encode("utf-8"), msg_timestamp.encode("utf-8"), raw_body]
+    )
     expected = hmac.new(key, signed, hashlib.sha256).digest()
     expected_base64 = base64.b64encode(expected).decode("ascii")
     # Recall uses Svix-style signatures; tolerate either space or comma separated
@@ -118,11 +132,12 @@ async def create_session(
 ) -> CreateSessionResponse:
     verify_api_key(x_api_key)
     logger.info(
-        "create_session request mirako_session_id=%s meeting_provider=%s mode=%s meeting_url_provided=%s",
+        "create_session request mirako_session_id=%s meeting_provider=%s mode=%s meeting_url_provided=%s active_sessions=%s",
         req.mirako_session_id,
         req.meeting_provider,
         req.mode,
         bool(req.meeting_url),
+        len(session_service.sessions),
     )
     try:
         response = await session_service.create_session(req)
@@ -170,7 +185,12 @@ async def close_session(
         )
         return response
     except SessionServiceError as exc:
-        logger.error("close_session failed session_id=%s status_code=%s detail=%s", session_id, exc.status_code, exc.detail)
+        logger.error(
+            "close_session failed session_id=%s status_code=%s detail=%s",
+            session_id,
+            exc.status_code,
+            exc.detail,
+        )
         raise HTTPException(status_code=exc.status_code, detail=exc.detail)
 
 
@@ -201,11 +221,14 @@ async def get_meeting_records(
 async def bridge_telemetry(req: BridgeTelemetryRequest) -> dict[str, bool]:
     session = session_service.get_session(req.session_id)
     known_session = session is not None
+    session_closed = bool(session and session.closed)
     bridge_logger.info(
-        "event=%s session_id=%s known_session=%s gateway_session_id=%s mirako_session_id=%s mode=%s elapsed_ms=%s payload=%s",
+        "event=%s session_id=%s known_session=%s session_closed=%s closed_reason=%s gateway_session_id=%s mirako_session_id=%s mode=%s elapsed_ms=%s payload=%s",
         req.event,
         req.session_id,
         known_session,
+        session_closed,
+        session.closed_reason if session else None,
         req.gateway_session_id,
         req.mirako_session_id,
         req.mode,
@@ -213,6 +236,40 @@ async def bridge_telemetry(req: BridgeTelemetryRequest) -> dict[str, bool]:
         json.dumps(req.payload or {}, ensure_ascii=True, sort_keys=True),
     )
     return {"ok": True}
+
+
+@router.get("/api/sessions/{session_id}/bridge-status", include_in_schema=False)
+async def bridge_session_status(session_id: str) -> dict[str, object]:
+    status = session_service.get_bridge_status(session_id)
+    if status is None:
+        logger.warning(
+            "bridge status requested for unknown session_id=%s; gateway reconnect allowed because no terminal close mark exists",
+            session_id,
+        )
+        return {
+            "session_id": session_id,
+            "closed": False,
+            "closed_reason": "unknown_session",
+            "can_connect_gateway": True,
+        }
+    logger.info(
+        "bridge status result session_id=%s mirako_session_id=%s closed=%s closed_reason=%s gateway_stopped=%s can_connect_gateway=%s",
+        session_id,
+        status.get("mirako_session_id"),
+        status.get("closed"),
+        status.get("closed_reason"),
+        status.get("gateway_stopped"),
+        status.get("can_connect_gateway"),
+    )
+    if not status["can_connect_gateway"]:
+        logger.info(
+            "bridge status blocks gateway connect session_id=%s mirako_session_id=%s closed_reason=%s gateway_stopped=%s",
+            session_id,
+            status.get("mirako_session_id"),
+            status.get("closed_reason"),
+            status.get("gateway_stopped"),
+        )
+    return status
 
 
 @router.post("/api/recall/transcript", include_in_schema=False)
@@ -232,7 +289,9 @@ async def recall_transcript_webhook(
             _safe_body_preview(raw_body),
         )
         raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-    metadata = (((payload.get("data") or {}).get("realtime_endpoint") or {}).get("metadata") or {})
+    metadata = ((payload.get("data") or {}).get("realtime_endpoint") or {}).get(
+        "metadata"
+    ) or {}
     recall_webhook_logger.info(
         "recall transcript payload event=%s session_id=%s mirako_session_id=%s",
         payload.get("event"),
@@ -260,7 +319,9 @@ async def recall_participant_events_webhook(
             _safe_body_preview(raw_body),
         )
         raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-    metadata = (((payload.get("data") or {}).get("realtime_endpoint") or {}).get("metadata") or {})
+    metadata = ((payload.get("data") or {}).get("realtime_endpoint") or {}).get(
+        "metadata"
+    ) or {}
     recall_webhook_logger.info(
         "recall participant payload event=%s session_id=%s mirako_session_id=%s",
         payload.get("event"),
@@ -288,7 +349,7 @@ async def recall_bot_status_webhook(
             _safe_body_preview(raw_body),
         )
         raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-    bot = ((payload.get("data") or {}).get("bot") or {})
+    bot = (payload.get("data") or {}).get("bot") or {}
     metadata = bot.get("metadata") or {}
     recall_webhook_logger.info(
         "recall bot status payload event=%s session_id=%s mirako_session_id=%s bot_id=%s",
@@ -301,7 +362,9 @@ async def recall_bot_status_webhook(
     return {"ok": True}
 
 
-@router.get("/bridge/{session_id}", response_class=HTMLResponse, include_in_schema=False)
+@router.get(
+    "/bridge/{session_id}", response_class=HTMLResponse, include_in_schema=False
+)
 async def bridge(session_id: str) -> HTMLResponse:
     session = session_service.get_session(session_id)
     if session is None:
@@ -314,6 +377,8 @@ async def bridge(session_id: str) -> HTMLResponse:
         "mirakoSessionId": session.mirako_session_id,
         "mode": session.mode,
         "conversationMode": session.conversation_mode,
+        "closed": session.closed,
+        "closedReason": session.closed_reason,
     }
     return HTMLResponse(html.replace("__BRIDGE_CONFIG__", json.dumps(bridge_config)))
 

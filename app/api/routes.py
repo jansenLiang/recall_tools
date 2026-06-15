@@ -11,18 +11,23 @@ import secrets
 from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 from fastapi.responses import FileResponse
+from fastapi.responses import PlainTextResponse
 
 from app.core.config import settings
 from app.core.paths import STATIC_DIR
 from app.schemas.sessions import (
     BridgeTelemetryRequest,
+    CaptureScreenRequest,
+    CaptureScreenResponse,
     CloseSessionResponse,
     CreateSessionRequest,
     CreateSessionResponse,
+    ListParticipantsResponse,
     MeetingRecordsResponse,
 )
 from app.services.recall_store import recall_store
 from app.services.session_service import SessionServiceError, session_service
+from app.services.zoom_zak import ZoomZakError, zoom_zak_service
 
 
 router = APIRouter()
@@ -195,6 +200,53 @@ async def close_session(
 
 
 @router.get(
+    "/api/sessions/{session_id}/participants",
+    response_model=ListParticipantsResponse,
+    summary="List meeting participants",
+    description="Return the participants currently known to recall_tools, joined with the cached H.264 frame status and the most recent screenshare sender.",
+)
+async def list_participants(
+    session_id: str,
+    x_api_key: str | None = Header(default=None, alias="x-api-key"),
+) -> ListParticipantsResponse:
+    verify_api_key(x_api_key)
+    try:
+        return await session_service.list_participants(session_id)
+    except SessionServiceError as exc:
+        logger.warning(
+            "list_participants failed session_id=%s status_code=%s detail=%s",
+            session_id,
+            exc.status_code,
+            exc.detail,
+        )
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+
+
+@router.post(
+    "/api/sessions/{session_id}/capture",
+    response_model=CaptureScreenResponse,
+    summary="Capture current meeting screen",
+    description="Decode the latest cached H.264 IDR frame for the requested participant (or the most recent screenshare sender) and optionally describe it with the MiniMax multimodal LLM.",
+)
+async def capture_screen(
+    session_id: str,
+    req: CaptureScreenRequest,
+    x_api_key: str | None = Header(default=None, alias="x-api-key"),
+) -> CaptureScreenResponse:
+    verify_api_key(x_api_key)
+    try:
+        return await session_service.capture_screen(session_id, req)
+    except SessionServiceError as exc:
+        logger.warning(
+            "capture_screen failed session_id=%s status_code=%s detail=%s",
+            session_id,
+            exc.status_code,
+            exc.detail,
+        )
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+
+
+@router.get(
     "/api/meeting-records",
     response_model=MeetingRecordsResponse,
     summary="Get meeting records",
@@ -215,6 +267,20 @@ async def get_meeting_records(
         offset=offset,
     )
     return MeetingRecordsResponse(**data)
+
+
+@router.get("/api/zoom/zak", response_class=PlainTextResponse, include_in_schema=False)
+async def zoom_zak_callback(secret: str = Query(default="")) -> PlainTextResponse:
+    expected = settings.zoom_zak_callback_secret
+    if not expected or not secret or not secrets.compare_digest(secret, expected):
+        logger.warning("zoom zak callback rejected invalid secret")
+        raise HTTPException(status_code=401, detail="Invalid ZAK callback secret.")
+    try:
+        token = await zoom_zak_service.get_zak()
+    except ZoomZakError as exc:
+        logger.error("zoom zak callback failed error=%s", exc)
+        raise HTTPException(status_code=502, detail=str(exc))
+    return PlainTextResponse(token)
 
 
 @router.post("/api/bridge-telemetry", include_in_schema=False)

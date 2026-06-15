@@ -1,21 +1,35 @@
 from __future__ import annotations
 
+import base64
+import io
 import logging
 import secrets
 import time
 from typing import Any
 
+import av
 import httpx
 
 from app.clients.recall import RecallClient
 from app.core.config import Settings, settings
 from app.models.session import Session
 from app.schemas.sessions import (
+    CaptureScreenRequest,
+    CaptureScreenResponse,
     CloseSessionResponse,
     CreateSessionRequest,
     CreateSessionResponse,
+    ListParticipantsResponse,
+    ParticipantInfo,
 )
+from app.services.frame_cache import CachedFrame, H264FrameCache
 from app.services.meeting_strategies import get_meeting_strategy
+from app.services.minimax_vision import (
+    MinimaxVisionClient,
+    MinimaxVisionError,
+    normalize_mime,
+)
+from app.services.recall_realtime import H264_EVENT, RecallRealtimeClient
 from app.services.recall_store import recall_store
 
 
@@ -33,9 +47,14 @@ class SessionService:
     def __init__(self, app_settings: Settings) -> None:
         self.settings = app_settings
         self.sessions: dict[str, Session] = {}
+        self._frame_caches: dict[str, H264FrameCache] = {}
+        self._realtime_clients: dict[str, RecallRealtimeClient] = {}
 
     def get_session(self, session_id: str) -> Session | None:
         return self.sessions.get(session_id)
+
+    def get_frame_cache(self, session_id: str) -> H264FrameCache | None:
+        return self._frame_caches.get(session_id)
 
     def get_session_by_recall_bot_id(self, bot_id: str) -> Session | None:
         for session in self.sessions.values():
@@ -191,6 +210,7 @@ class SessionService:
             recall_bot_id=session.recall_bot_id,
             recall_bot=bot,
         )
+        await self._start_realtime_capture(session_id)
         recall_store.add_event(
             event_type="bot.create",
             session_id=session_id,
@@ -295,6 +315,10 @@ class SessionService:
                 "participant_events.join",
                 "participant_events.leave",
                 "participant_events.update",
+                "participant_events.speech_on",
+                "participant_events.speech_off",
+                "participant_events.screenshare_on",
+                "participant_events.screenshare_off",
             }:
                 logger.info("recall participant webhook ignored event=%s", event)
                 return {"ok": True, "ignored": True}
@@ -327,8 +351,15 @@ class SessionService:
 
             if event == "participant_events.leave":
                 session.meeting_participants.pop(participant_id, None)
+                session.sharing_participant_ids.discard(participant_id)
             else:
                 session.meeting_participants[participant_id] = participant
+                if event == "participant_events.screenshare_on":
+                    session.sharing_participant_ids.add(participant_id)
+                    session.last_sharing_participant_id = participant_id
+                    session.last_sharing_event_at = time.time()
+                elif event == "participant_events.screenshare_off":
+                    session.sharing_participant_ids.discard(participant_id)
 
             self._refresh_participant_state(session)
             desired_mode = self._desired_conversation_mode(
@@ -513,6 +544,8 @@ class SessionService:
                         self._http_error_detail(exc, service=session.meeting_provider),
                     )
 
+        await self._stop_realtime_capture(session_id)
+
         return CloseSessionResponse(
             session_id=session_id,
             recall_left=recall_left,
@@ -521,6 +554,140 @@ class SessionService:
             gateway_response=gateway_response,
             zoom_ended=zoom_ended,
             zoom_response=zoom_response,
+        )
+
+    async def list_participants(self, session_id: str) -> ListParticipantsResponse:
+        session = self.get_session(session_id)
+        if session is None:
+            raise SessionServiceError(404, "Unknown session_id.")
+        if session.closed:
+            logger.info(
+                "list_participants on closed session_id=%s reason=%s",
+                session_id,
+                session.closed_reason,
+            )
+        cache = self._frame_caches.get(session_id)
+        cached: set[str] = set()
+        if cache is not None:
+            for item in await cache.list_participants():
+                pid = item.get("participant_id")
+                if pid:
+                    cached.add(str(pid))
+        participants: list[ParticipantInfo] = []
+        for pid, info in session.meeting_participants.items():
+            participants.append(
+                ParticipantInfo(
+                    participant_id=pid,
+                    name=str(info.get("name") or ""),
+                    is_host=bool(info.get("is_host")),
+                    email=info.get("email"),
+                    is_screensharing=pid in session.sharing_participant_ids,
+                    has_cached_frame=pid in cached,
+                )
+            )
+        participants.sort(
+            key=lambda p: (not p.is_screensharing, p.name.lower(), p.participant_id)
+        )
+        return ListParticipantsResponse(
+            session_id=session_id,
+            mirako_session_id=session.mirako_session_id,
+            participants=participants,
+            last_sharing_participant_id=session.last_sharing_participant_id,
+        )
+
+    async def capture_screen(
+        self,
+        session_id: str,
+        req: CaptureScreenRequest,
+    ) -> CaptureScreenResponse:
+        session = self.get_session(session_id)
+        if session is None:
+            raise SessionServiceError(404, "Unknown session_id.")
+        if not self.settings.recall_video_separate_h264_enabled:
+            raise SessionServiceError(
+                400,
+                {
+                    "error": "video_separate_h264_disabled",
+                    "message": "RECALL_VIDEO_SEPARATE_H264_ENABLED is false.",
+                },
+            )
+        cache = self._frame_caches.get(session_id)
+        if cache is None:
+            raise SessionServiceError(
+                503,
+                {
+                    "error": "frame_cache_not_ready",
+                    "message": "H264 frame cache is not initialized for this session.",
+                },
+            )
+        frame_type = req.frame_type if req.frame_type in {"webcam", "screenshare"} else "screenshare"
+        cached: CachedFrame | None
+        target_pid: str | None
+        if req.participant_id:
+            cached = await cache.get_frame(
+                participant_id=req.participant_id, frame_type=frame_type
+            )
+            target_pid = req.participant_id
+        else:
+            cached = await cache.latest_frame(frame_type=frame_type)
+            target_pid = cached.participant_id if cached else None
+        if cached is None:
+            if req.participant_id:
+                raise SessionServiceError(
+                    404,
+                    {
+                        "error": "no_cached_frame",
+                        "participant_id": req.participant_id,
+                        "frame_type": frame_type,
+                    },
+                )
+            raise SessionServiceError(
+                404,
+                {
+                    "error": "no_cached_frame",
+                    "message": f"No cached {frame_type} frame available yet.",
+                },
+            )
+        try:
+            png_bytes = self._decode_idr_to_png(cached)
+        except Exception as exc:
+            logger.exception(
+                "capture_screen decode failed session_id=%s participant_id=%s",
+                session_id,
+                target_pid,
+            )
+            raise SessionServiceError(
+                502,
+                {
+                    "error": "decode_failed",
+                    "message": str(exc),
+                },
+            ) from exc
+        participant_name = ""
+        if target_pid:
+            info = session.meeting_participants.get(target_pid)
+            if info:
+                participant_name = str(info.get("name") or "")
+        description = await self._describe_with_minimax(
+            png_bytes=png_bytes,
+            prompt=req.prompt or self.settings.capture_prompt,
+        )
+        return CaptureScreenResponse(
+            session_id=session_id,
+            mirako_session_id=session.mirako_session_id,
+            participant_id=target_pid or "",
+            participant_name=participant_name,
+            frame_type=frame_type,
+            received_at=cached.received_at,
+            captured_at=time.time(),
+            frame_age_ms=int(max(0.0, (time.time() - cached.received_at) * 1000)),
+            width=cached.width,
+            height=cached.height,
+            description=description,
+            image_base64=(
+                _b64encode(png_bytes) if req.include_image_base64 else None
+            ),
+            mime_type="image/png",
         )
 
     def _normalize_public_base_url(self) -> str:
@@ -591,6 +758,7 @@ class SessionService:
                 },
                 recording_config=self._recall_recording_config(req, bridge_url),
                 automatic_leave=self._recall_automatic_leave_config(),
+                zoom=self._recall_zoom_config(req, bridge_url),
             )
         except httpx.HTTPStatusError as exc:
             logger.exception(
@@ -685,7 +853,16 @@ class SessionService:
             return None
         public_base_url = bridge_url.rsplit("/bridge/", 1)[0]
         session_id = bridge_url.rsplit("/", 1)[-1]
-        return {
+        participant_events = [
+            "participant_events.join",
+            "participant_events.leave",
+            "participant_events.update",
+            "participant_events.speech_on",
+            "participant_events.speech_off",
+            "participant_events.screenshare_on",
+            "participant_events.screenshare_off",
+        ]
+        config: dict[str, Any] = {
             "transcript": {
                 "provider": {
                     "recallai_streaming": {
@@ -708,11 +885,7 @@ class SessionService:
                 {
                     "type": "webhook",
                     "url": f"{public_base_url}/api/recall/participant-events",
-                    "events": [
-                        "participant_events.join",
-                        "participant_events.leave",
-                        "participant_events.update",
-                    ],
+                    "events": participant_events,
                     "metadata": {
                         "session_id": session_id,
                         "mirako_session_id": req.mirako_session_id,
@@ -720,6 +893,10 @@ class SessionService:
                 },
             ],
         }
+        if self.settings.recall_video_separate_h264_enabled:
+            config["video_separate_h264"] = {}
+            config["video_mixed_layout"] = self.settings.recall_video_mixed_layout
+        return config
 
     def _recall_automatic_leave_config(self) -> dict[str, Any]:
         return {
@@ -730,6 +907,134 @@ class SessionService:
                 ),
             }
         }
+
+    def _recall_zoom_config(
+        self, req: CreateSessionRequest, bridge_url: str
+    ) -> dict[str, Any] | None:
+        if req.meeting_provider != "zoom" or not self.settings.zoom_signed_in_enabled:
+            return None
+        public_base_url = bridge_url.rsplit("/bridge/", 1)[0]
+        secret = self.settings.zoom_zak_callback_secret
+        if not secret:
+            raise SessionServiceError(
+                400,
+                {
+                    "error": "zoom_zak_callback_secret_required",
+                    "message": "Set ZOOM_ZAK_CALLBACK_SECRET or SERVICE_API_KEY before enabling signed-in Zoom bots.",
+                },
+            )
+        return {"zak_url": f"{public_base_url}/api/zoom/zak?secret={secret}"}
+
+    async def _start_realtime_capture(self, session_id: str) -> None:
+        if not self.settings.recall_video_separate_h264_enabled:
+            return
+        session = self.sessions.get(session_id)
+        if session is None or not session.recall_bot_id:
+            return
+        cache = self._frame_caches.get(session_id)
+        if cache is None:
+            cache = H264FrameCache(
+                max_participants=self.settings.frame_cache_max_participants,
+                max_age_seconds=self.settings.frame_cache_max_age_seconds,
+                max_bytes=self.settings.frame_cache_max_bytes,
+            )
+            self._frame_caches[session_id] = cache
+        if session_id in self._realtime_clients and self._realtime_clients[session_id].is_running():
+            return
+        client = RecallRealtimeClient(
+            ws_url=self.settings.recall_realtime_ws_url,
+            api_key=self.settings.recall_api_key,
+            bot_id=session.recall_bot_id,
+            events=[H264_EVENT],
+            on_event=self._build_h264_handler(session_id, cache),
+        )
+        self._realtime_clients[session_id] = client
+        client.start()
+        logger.info(
+            "recall realtime capture started session_id=%s bot_id=%s ws_url=%s",
+            session_id,
+            session.recall_bot_id,
+            self.settings.recall_realtime_ws_url,
+        )
+
+    async def _stop_realtime_capture(self, session_id: str) -> None:
+        client = self._realtime_clients.pop(session_id, None)
+        if client is not None:
+            try:
+                await client.stop()
+            except Exception:
+                logger.exception("recall realtime capture stop failed session_id=%s", session_id)
+        cache = self._frame_caches.pop(session_id, None)
+        if cache is not None:
+            try:
+                await cache.clear()
+            except Exception:
+                logger.exception("frame cache clear failed session_id=%s", session_id)
+        logger.info("recall realtime capture stopped session_id=%s", session_id)
+
+    def _build_h264_handler(
+        self, session_id: str, cache: H264FrameCache
+    ):
+        async def handle(event: str, data: dict[str, Any]) -> None:
+            if event != H264_EVENT:
+                return
+            frame_type = str(data.get("type") or "")
+            buffer_b64 = str(data.get("buffer") or "")
+            participant = data.get("participant") or {}
+            pid = participant.get("id")
+            if pid is None:
+                return
+            await cache.ingest(
+                participant_id=str(pid),
+                frame_type=frame_type,
+                buffer_b64=buffer_b64,
+            )
+            session = self.sessions.get(session_id)
+            if session is not None and frame_type == "screenshare":
+                session.last_sharing_participant_id = str(pid)
+                session.last_sharing_event_at = time.time()
+
+        return handle
+
+    def _decode_idr_to_png(self, frame: CachedFrame) -> bytes:
+        container = av.open(io.BytesIO(frame.annexb_bytes), format="h264")
+        stream = container.streams.video[0]
+        for packet in container.demux(stream):
+            for decoded in packet.decode():
+                width = decoded.width
+                height = decoded.height
+                frame.width = width
+                frame.height = height
+                img = decoded.to_image()
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                container.close()
+                return buf.getvalue()
+        container.close()
+        raise RuntimeError("No decodable frame in cached H264 buffer.")
+
+    async def _describe_with_minimax(self, *, png_bytes: bytes, prompt: str) -> str:
+        if not self.settings.minimax_api_key:
+            return ""
+        client = MinimaxVisionClient(
+            api_base=self.settings.minimax_api_base,
+            api_key=self.settings.minimax_api_key,
+            model=self.settings.minimax_model,
+            timeout_seconds=self.settings.minimax_timeout_seconds,
+        )
+        try:
+            return await client.describe_image(
+                image_bytes=png_bytes,
+                mime_type=normalize_mime(png_bytes),
+                prompt=prompt,
+            )
+        except MinimaxVisionError as exc:
+            logger.error(
+                "minimax vision call failed status=%s detail=%s",
+                exc.status_code,
+                exc.detail,
+            )
+            return ""
 
     def _refresh_participant_state(self, session: Session) -> None:
         non_bot_participants = {
@@ -969,3 +1274,7 @@ class SessionService:
 
 
 session_service = SessionService(settings)
+
+
+def _b64encode(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")

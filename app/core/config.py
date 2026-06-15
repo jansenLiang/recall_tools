@@ -65,12 +65,40 @@ class Settings:
         if self.conversation_mode_policy not in {"auto", "multi", "single"}:
             self.conversation_mode_policy = "auto"
 
+        self.recall_video_separate_h264_enabled = env(
+            "RECALL_VIDEO_SEPARATE_H264_ENABLED", "true"
+        ).lower() in {"1", "true", "yes"}
+        self.recall_video_mixed_layout = env("RECALL_VIDEO_MIXED_LAYOUT", "gallery_view_v2")
+        self.recall_realtime_ws_url = env(
+            "RECALL_REALTIME_WS_URL", "wss://us-east-1.recall.ai/realtime"
+        )
+        self.frame_cache_max_participants = env_int("FRAME_CACHE_MAX_PARTICIPANTS", 32)
+        self.frame_cache_max_age_seconds = env_int("FRAME_CACHE_MAX_AGE_SECONDS", 300)
+        self.frame_cache_max_bytes = env_int("FRAME_CACHE_MAX_BYTES", 64 * 1024 * 1024)
+
+        self.minimax_api_base = env("MINIMAX_API_BASE", "https://api.minimaxi.com/v1")
+        self.minimax_api_key = env("MINIMAX_API_KEY")
+        self.minimax_model = env("MINIMAX_MODEL", "MiniMax-VL-01")
+        self.minimax_timeout_seconds = env_int("MINIMAX_TIMEOUT_SECONDS", 60)
+        self.capture_prompt = env(
+            "CAPTURE_PROMPT",
+            "Please describe what is on this meeting screen. Focus on text content, slide titles, bullet points, and key data. If this is a shared screen or slide, transcribe the visible text. Respond concisely.",
+        )
+
         self.zoom_oauth_client_id = env("ZOOM_OAUTH_CLIENT_ID")
         self.zoom_oauth_client_secret = env("ZOOM_OAUTH_CLIENT_SECRET")
         self.zoom_oauth_account_id = env("ZOOM_OAUTH_ACCOUNT_ID")
         self.zoom_create_user_id = env("ZOOM_CREATE_USER_ID")
         self.zoom_create_topic = env("ZOOM_CREATE_TOPIC", "Mirako Recall Bridge")
         self.zoom_create_duration_minutes = env_int("ZOOM_CREATE_DURATION_MINUTES", 60)
+        self.zoom_signed_in_enabled = env("ZOOM_SIGNED_IN_ENABLED", "false").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        self.zoom_zak_user_id = env("ZOOM_ZAK_USER_ID", self.zoom_create_user_id or "me")
+        self.zoom_zak_cache_ttl_seconds = env_int("ZOOM_ZAK_CACHE_TTL_SECONDS", 5400)
+        self.zoom_zak_callback_secret = env("ZOOM_ZAK_CALLBACK_SECRET", self.service_api_key)
 
 
 settings = Settings()

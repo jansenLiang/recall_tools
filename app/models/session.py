@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -29,3 +29,6 @@ class Session:
     closed: bool = False
     closed_reason: str | None = None
     closed_at: float | None = None
+    sharing_participant_ids: set[str] = field(default_factory=set)
+    last_sharing_participant_id: str | None = None
+    last_sharing_event_at: float | None = None

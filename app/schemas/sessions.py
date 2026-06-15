@@ -65,3 +65,57 @@ class BridgeTelemetryRequest(BaseModel):
     mode: str | None = None
     elapsed_ms: int | None = None
     payload: dict[str, Any] | None = None
+
+
+class ParticipantInfo(BaseModel):
+    participant_id: str
+    name: str = ""
+    is_host: bool = False
+    email: str | None = None
+    is_screensharing: bool = False
+    has_cached_frame: bool = False
+
+
+class ListParticipantsResponse(BaseModel):
+    session_id: str
+    mirako_session_id: str
+    participants: list[ParticipantInfo]
+    last_sharing_participant_id: str | None = None
+
+
+class CaptureScreenRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    participant_id: str | None = Field(
+        default=None,
+        description="Target participant id from /participants. When omitted, the most recent screenshare frame is used.",
+    )
+    frame_type: Literal["webcam", "screenshare"] = Field(
+        default="screenshare",
+        description="Recall video_separate_h264.data stream type to draw from.",
+    )
+    include_image_base64: bool = Field(
+        default=False,
+        description="Include the decoded PNG as base64 in the response (debug).",
+    )
+    prompt: str | None = Field(
+        default=None,
+        max_length=2000,
+        description="Override the MiniMax vision prompt. Falls back to CAPTURE_PROMPT.",
+    )
+
+
+class CaptureScreenResponse(BaseModel):
+    session_id: str
+    mirako_session_id: str
+    participant_id: str
+    participant_name: str = ""
+    frame_type: Literal["webcam", "screenshare"]
+    received_at: float
+    captured_at: float
+    frame_age_ms: int
+    width: int | None = None
+    height: int | None = None
+    description: str = ""
+    image_base64: str | None = None
+    mime_type: str = "image/png"

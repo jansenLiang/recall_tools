@@ -53,6 +53,21 @@ class RecallClient:
             payload["automatic_leave"] = automatic_leave
         if zoom is not None:
             payload["zoom"] = zoom
+        transcript_provider = (
+            ((recording_config or {}).get("transcript") or {}).get("provider") or {}
+        ).get("recallai_streaming") or {}
+        realtime_endpoints = (recording_config or {}).get("realtime_endpoints") or []
+        endpoint_events = [endpoint.get("events") for endpoint in realtime_endpoints]
+        logger.info(
+            "recall create_bot payload summary output_media=%s recording_config=%s transcript_mode=%s transcript_language_code=%s realtime_endpoint_events=%s automatic_leave=%s zoom_signed_in=%s",
+            output_media_url is not None,
+            recording_config is not None,
+            transcript_provider.get("mode"),
+            transcript_provider.get("language_code"),
+            endpoint_events,
+            automatic_leave is not None,
+            bool(zoom and zoom.get("zak_url")),
+        )
 
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(
@@ -65,10 +80,17 @@ class RecallClient:
                 json=payload,
             )
             if response.status_code >= 400:
-                logger.error("recall create_bot failed status_code=%s response=%s", response.status_code, response.text)
+                logger.error(
+                    "recall create_bot failed status_code=%s response=%s",
+                    response.status_code,
+                    response.text,
+                )
             response.raise_for_status()
             data = response.json()
-            logger.info("recall create_bot success bot_id=%s", data.get("id") or data.get("bot_id"))
+            logger.info(
+                "recall create_bot success bot_id=%s",
+                data.get("id") or data.get("bot_id"),
+            )
             return data
 
     @staticmethod
@@ -91,10 +113,17 @@ class RecallClient:
                 },
             )
             if response.status_code >= 400:
-                logger.error("recall leave_call failed bot_id=%s status_code=%s response=%s", bot_id, response.status_code, response.text)
+                logger.error(
+                    "recall leave_call failed bot_id=%s status_code=%s response=%s",
+                    bot_id,
+                    response.status_code,
+                    response.text,
+                )
             response.raise_for_status()
             if not response.content:
-                logger.info("recall leave_call success bot_id=%s empty_response=true", bot_id)
+                logger.info(
+                    "recall leave_call success bot_id=%s empty_response=true", bot_id
+                )
                 return None
             data = response.json()
             logger.info("recall leave_call success bot_id=%s", bot_id)

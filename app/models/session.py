@@ -14,6 +14,7 @@ class Session:
     meeting_provider: str
     meeting_url: str
     bridge_url: str
+    bot_name: str
     recall_bot_id: str
     recall_bot: dict[str, Any]
     transcript_utterances: list[dict[str, Any]]

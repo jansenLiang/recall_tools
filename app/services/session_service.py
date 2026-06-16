@@ -137,6 +137,7 @@ class SessionService:
             )
 
         initial_conversation_mode = self._initial_conversation_mode()
+        bot_name = req.bot_name or self.settings.bot_name
         self.sessions[session_id] = Session(
             session_id=session_id,
             created_at=time.time(),
@@ -146,6 +147,7 @@ class SessionService:
             meeting_provider=req.meeting_provider,
             meeting_url=meeting_url,
             bridge_url=bridge_url,
+            bot_name=bot_name,
             recall_bot_id="",
             recall_bot={},
             transcript_utterances=[],
@@ -295,11 +297,15 @@ class SessionService:
                 payload=payload,
             )
             logger.info(
-                "recall transcript stored session_id=%s speaker=%s words=%s chars=%s",
+                "recall transcript stored session_id=%s speaker=%s language_code=%s words=%s chars=%s start_time=%s end_time=%s content_preview=%s",
                 session.session_id,
                 speaker,
+                transcript_data.get("language_code"),
                 len(words),
                 len(content),
+                start_time,
+                end_time,
+                content[:120],
             )
             return {"ok": True, "stored": True}
         except Exception:
@@ -319,6 +325,7 @@ class SessionService:
                 "participant_events.speech_off",
                 "participant_events.screenshare_on",
                 "participant_events.screenshare_off",
+                "participant_events.chat_message",
             }:
                 logger.info("recall participant webhook ignored event=%s", event)
                 return {"ok": True, "ignored": True}
@@ -340,6 +347,9 @@ class SessionService:
             participant = ((payload.get("data") or {}).get("data") or {}).get(
                 "participant"
             ) or {}
+            participant_event_data = (payload.get("data") or {}).get("data") or {}
+            chat_data = participant_event_data.get("data") or {}
+            timestamp = participant_event_data.get("timestamp") or {}
             participant_id = self._participant_key(participant)
             if not participant_id:
                 logger.warning(
@@ -348,6 +358,37 @@ class SessionService:
                     payload,
                 )
                 return {"ok": True, "ignored": True, "reason": "missing_participant_id"}
+
+            if event == "participant_events.chat_message":
+                logger.info(
+                    "recall chat message received session_id=%s mirako_session_id=%s participant_id=%s participant_name=%s participant_email=%s chat_to=%s text=%s timestamp_absolute=%s timestamp_relative=%s",
+                    session.session_id,
+                    session.mirako_session_id,
+                    participant_id,
+                    participant.get("name"),
+                    participant.get("email"),
+                    chat_data.get("to") if isinstance(chat_data, dict) else None,
+                    chat_data.get("text") if isinstance(chat_data, dict) else None,
+                    timestamp.get("absolute") if isinstance(timestamp, dict) else None,
+                    timestamp.get("relative") if isinstance(timestamp, dict) else None,
+                )
+                bot_mentioned, command_text = self._parse_bot_mention(
+                    chat_data.get("text") if isinstance(chat_data, dict) else None,
+                    session.bot_name,
+                )
+                logger.info(
+                    "recall chat command parsed session_id=%s mirako_session_id=%s bot_name=%s bot_mentioned=%s command_text=%s",
+                    session.session_id,
+                    session.mirako_session_id,
+                    session.bot_name,
+                    bot_mentioned,
+                    command_text,
+                )
+                await self._handle_gateway_chat_command(
+                    session,
+                    bot_mentioned=bot_mentioned,
+                    command_text=command_text,
+                )
 
             if event == "participant_events.leave":
                 session.meeting_participants.pop(participant_id, None)
@@ -620,7 +661,11 @@ class SessionService:
                     "message": "H264 frame cache is not initialized for this session.",
                 },
             )
-        frame_type = req.frame_type if req.frame_type in {"webcam", "screenshare"} else "screenshare"
+        frame_type = (
+            req.frame_type
+            if req.frame_type in {"webcam", "screenshare"}
+            else "screenshare"
+        )
         cached: CachedFrame | None
         target_pid: str | None
         if req.participant_id:
@@ -684,9 +729,7 @@ class SessionService:
             width=cached.width,
             height=cached.height,
             description=description,
-            image_base64=(
-                _b64encode(png_bytes) if req.include_image_base64 else None
-            ),
+            image_base64=(_b64encode(png_bytes) if req.include_image_base64 else None),
             mime_type="image/png",
         )
 
@@ -742,10 +785,14 @@ class SessionService:
     ) -> dict[str, Any]:
         try:
             logger.info(
-                "creating recall bot provider=%s mode=%s bridge_url=%s",
+                "creating recall bot provider=%s mode=%s bridge_url=%s transcript_enabled=%s transcript_mode=%s transcript_language_code=%s signed_in_zoom=%s",
                 req.meeting_provider,
                 req.mode,
                 bridge_url,
+                self.settings.recall_transcript_enabled,
+                self.settings.recall_transcript_mode,
+                self.settings.recall_transcript_language_code,
+                self.settings.zoom_signed_in_enabled,
             )
             return await self._recall_client().create_bot(
                 meeting_url=meeting_url,
@@ -825,6 +872,53 @@ class SessionService:
             except ValueError:
                 return {"status_code": response.status_code, "response": response.text}
 
+    async def _handle_gateway_chat_command(
+        self,
+        session: Session,
+        *,
+        bot_mentioned: bool,
+        command_text: str,
+    ) -> None:
+        if not self.settings.chat_gateway_commands_enabled:
+            return
+        if not bot_mentioned:
+            return
+        command = (
+            command_text.strip().split(maxsplit=1)[0].lower()
+            if command_text.strip()
+            else ""
+        )
+        if command not in {"start", "pause"}:
+            logger.info(
+                "recall chat command not routed to gateway session_id=%s mirako_session_id=%s command=%s",
+                session.session_id,
+                session.mirako_session_id,
+                command,
+            )
+            return
+        async with httpx.AsyncClient(timeout=5) as client:
+            logger.info(
+                "posting gateway assistant state from chat session_id=%s mirako_session_id=%s command=%s gateway_url=%s",
+                session.session_id,
+                session.mirako_session_id,
+                command,
+                session.gateway_url,
+            )
+            response = await client.post(
+                f"{session.gateway_url}/api/sessions/{session.mirako_session_id}/assistant-state",
+                headers={"Accept": "application/json"},
+                json={"state": command},
+            )
+            logger.info(
+                "gateway assistant state response session_id=%s mirako_session_id=%s command=%s status_code=%s body=%s",
+                session.session_id,
+                session.mirako_session_id,
+                command,
+                response.status_code,
+                response.text[:500],
+            )
+            response.raise_for_status()
+
     async def _set_gateway_conversation_mode(self, session: Session, mode: str) -> None:
         async with httpx.AsyncClient(timeout=10) as client:
             response = await client.post(
@@ -861,6 +955,7 @@ class SessionService:
             "participant_events.speech_off",
             "participant_events.screenshare_on",
             "participant_events.screenshare_off",
+            "participant_events.chat_message",
         ]
         config: dict[str, Any] = {
             "transcript": {
@@ -896,6 +991,16 @@ class SessionService:
         if self.settings.recall_video_separate_h264_enabled:
             config["video_separate_h264"] = {}
             config["video_mixed_layout"] = self.settings.recall_video_mixed_layout
+        logger.info(
+            "recall recording config built session_id=%s transcript_mode=%s transcript_language_code=%s transcript_webhook_events=%s participant_webhook_events=%s video_separate_h264=%s video_mixed_layout=%s",
+            session_id,
+            self.settings.recall_transcript_mode,
+            self.settings.recall_transcript_language_code,
+            ["transcript.data"],
+            participant_events,
+            self.settings.recall_video_separate_h264_enabled,
+            config.get("video_mixed_layout"),
+        )
         return config
 
     def _recall_automatic_leave_config(self) -> dict[str, Any]:
@@ -939,7 +1044,10 @@ class SessionService:
                 max_bytes=self.settings.frame_cache_max_bytes,
             )
             self._frame_caches[session_id] = cache
-        if session_id in self._realtime_clients and self._realtime_clients[session_id].is_running():
+        if (
+            session_id in self._realtime_clients
+            and self._realtime_clients[session_id].is_running()
+        ):
             return
         client = RecallRealtimeClient(
             ws_url=self.settings.recall_realtime_ws_url,
@@ -963,7 +1071,9 @@ class SessionService:
             try:
                 await client.stop()
             except Exception:
-                logger.exception("recall realtime capture stop failed session_id=%s", session_id)
+                logger.exception(
+                    "recall realtime capture stop failed session_id=%s", session_id
+                )
         cache = self._frame_caches.pop(session_id, None)
         if cache is not None:
             try:
@@ -972,9 +1082,7 @@ class SessionService:
                 logger.exception("frame cache clear failed session_id=%s", session_id)
         logger.info("recall realtime capture stopped session_id=%s", session_id)
 
-    def _build_h264_handler(
-        self, session_id: str, cache: H264FrameCache
-    ):
+    def _build_h264_handler(self, session_id: str, cache: H264FrameCache):
         async def handle(event: str, data: dict[str, Any]) -> None:
             if event != H264_EVENT:
                 return
@@ -1058,6 +1166,19 @@ class SessionService:
         name = str(participant.get("name") or "").strip().lower()
         bot_name = self.settings.bot_name.strip().lower()
         return bool(bot_name and name == bot_name)
+
+    def _session_bot_name(self, session: Session) -> str:
+        return (session.bot_name or self.settings.bot_name).strip()
+
+    @staticmethod
+    def _parse_bot_mention(text: object, bot_name: str) -> tuple[bool, str]:
+        content = str(text or "").strip()
+        mention = f"@{bot_name.strip()}"
+        if not content or not mention.strip():
+            return False, content
+        if not content.lower().startswith(mention.lower()):
+            return False, content
+        return True, content[len(mention) :].strip()
 
     async def cleanup_bot_only_sessions(self) -> None:
         if not self.settings.bot_only_cleanup_enabled:

@@ -54,6 +54,19 @@ def _safe_headers(headers: dict[str, str]) -> dict[str, str]:
     return safe
 
 
+def _word_text(words: object, index: int) -> str | None:
+    if not isinstance(words, list) or not words:
+        return None
+    try:
+        word = words[index]
+    except IndexError:
+        return None
+    if not isinstance(word, dict):
+        return None
+    text = str(word.get("text") or "").strip()
+    return text or None
+
+
 def verify_api_key(x_api_key: str | None = Header(default=None)) -> None:
     if not settings.service_api_key:
         return
@@ -358,11 +371,17 @@ async def recall_transcript_webhook(
     metadata = ((payload.get("data") or {}).get("realtime_endpoint") or {}).get(
         "metadata"
     ) or {}
+    transcript_data = (payload.get("data") or {}).get("data") or {}
+    words = transcript_data.get("words") or []
     recall_webhook_logger.info(
-        "recall transcript payload event=%s session_id=%s mirako_session_id=%s",
+        "recall transcript payload event=%s session_id=%s mirako_session_id=%s language_code=%s words=%s first_word=%s last_word=%s",
         payload.get("event"),
         metadata.get("session_id"),
         metadata.get("mirako_session_id"),
+        transcript_data.get("language_code"),
+        len(words) if isinstance(words, list) else 0,
+        _word_text(words, 0),
+        _word_text(words, -1),
     )
     background_tasks.add_task(session_service.handle_recall_transcript, payload)
     return {"ok": True}
@@ -388,11 +407,18 @@ async def recall_participant_events_webhook(
     metadata = ((payload.get("data") or {}).get("realtime_endpoint") or {}).get(
         "metadata"
     ) or {}
+    participant_event_data = (payload.get("data") or {}).get("data") or {}
+    chat_data = participant_event_data.get("data") or {}
+    participant = participant_event_data.get("participant") or {}
     recall_webhook_logger.info(
-        "recall participant payload event=%s session_id=%s mirako_session_id=%s",
+        "recall participant payload event=%s session_id=%s mirako_session_id=%s participant_id=%s participant_name=%s chat_to=%s chat_text_preview=%s",
         payload.get("event"),
         metadata.get("session_id"),
         metadata.get("mirako_session_id"),
+        participant.get("id") if isinstance(participant, dict) else None,
+        participant.get("name") if isinstance(participant, dict) else None,
+        chat_data.get("to") if isinstance(chat_data, dict) else None,
+        str(chat_data.get("text") or "")[:200] if isinstance(chat_data, dict) else None,
     )
     background_tasks.add_task(session_service.handle_recall_participant_event, payload)
     return {"ok": True}

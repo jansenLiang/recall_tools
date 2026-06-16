@@ -268,11 +268,14 @@
       await assertBridgeCanConnect();
       sendTelemetry("gateway-session-create-start", {
         gatewayUrl: config.gatewayUrl,
+        recallSessionId: config.sessionId,
+        mirakoSessionId: config.mirakoSessionId,
         mediaMode,
         conversationMode: config.conversationMode || "multi",
       });
       const setup = await postJson("/api/sessions", {
         api_key: config.mirakoSessionId,
+        recall_session_id: config.sessionId,
         media_mode: mediaMode,
         conversation_mode: config.conversationMode || "multi",
       });

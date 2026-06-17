@@ -23,6 +23,7 @@ from app.schemas.sessions import (
     ParticipantInfo,
 )
 from app.services.frame_cache import CachedFrame, H264FrameCache
+from app.services.hermes_agent import HermesAgentClient, HermesAgentError
 from app.services.meeting_strategies import get_meeting_strategy
 from app.services.minimax_vision import (
     MinimaxVisionClient,
@@ -384,11 +385,17 @@ class SessionService:
                     bot_mentioned,
                     command_text,
                 )
-                await self._handle_gateway_chat_command(
+                routed_to_gateway = await self._handle_gateway_chat_command(
                     session,
                     bot_mentioned=bot_mentioned,
                     command_text=command_text,
                 )
+                if not routed_to_gateway:
+                    await self._handle_agent_chat_message(
+                        session,
+                        bot_mentioned=bot_mentioned,
+                        command_text=command_text,
+                    )
 
             if event == "participant_events.leave":
                 session.meeting_participants.pop(participant_id, None)
@@ -878,11 +885,11 @@ class SessionService:
         *,
         bot_mentioned: bool,
         command_text: str,
-    ) -> None:
+    ) -> bool:
         if not self.settings.chat_gateway_commands_enabled:
-            return
+            return False
         if not bot_mentioned:
-            return
+            return False
         command = (
             command_text.strip().split(maxsplit=1)[0].lower()
             if command_text.strip()
@@ -895,7 +902,7 @@ class SessionService:
                 session.mirako_session_id,
                 command,
             )
-            return
+            return False
         async with httpx.AsyncClient(timeout=5) as client:
             logger.info(
                 "posting gateway assistant state from chat session_id=%s mirako_session_id=%s command=%s gateway_url=%s",
@@ -918,6 +925,78 @@ class SessionService:
                 response.text[:500],
             )
             response.raise_for_status()
+            return True
+
+    async def _handle_agent_chat_message(
+        self,
+        session: Session,
+        *,
+        bot_mentioned: bool,
+        command_text: str,
+    ) -> None:
+        if not self.settings.chat_agent_enabled:
+            return
+        if not bot_mentioned:
+            return
+        message = command_text.strip()
+        if not message:
+            return
+        client = HermesAgentClient(
+            api_url=self.settings.hermes_agent_api_url,
+            api_key=self.settings.hermes_agent_api_key,
+            model=self.settings.hermes_agent_model,
+            timeout_seconds=self.settings.hermes_agent_timeout_seconds,
+        )
+        chunks: list[str] = []
+        logger.info(
+            "posting recall chat message to hermes agent session_id=%s mirako_session_id=%s recall_session_id=%s chars=%s api_url=%s model=%s",
+            session.session_id,
+            session.mirako_session_id,
+            session.session_id,
+            len(message),
+            self.settings.hermes_agent_api_url,
+            self.settings.hermes_agent_model,
+        )
+        try:
+            async for chunk in client.chat(session_id=session.session_id, message=message):
+                chunks.append(chunk)
+        except HermesAgentError as exc:
+            logger.error(
+                "hermes agent chat failed session_id=%s mirako_session_id=%s status_code=%s detail=%s",
+                session.session_id,
+                session.mirako_session_id,
+                exc.status_code,
+                exc.detail[:1000],
+            )
+            return
+        response_text = "".join(chunks).strip()
+        if not response_text:
+            logger.info(
+                "hermes agent returned empty response session_id=%s mirako_session_id=%s",
+                session.session_id,
+                session.mirako_session_id,
+            )
+            return
+        await self._send_recall_chat_reply(session, response_text)
+
+    async def _send_recall_chat_reply(self, session: Session, message: str) -> None:
+        if not session.recall_bot_id:
+            return
+        text = message[:4096]
+        try:
+            await self._recall_client().send_chat_message(
+                session.recall_bot_id,
+                message=text,
+                to="everyone",
+            )
+        except Exception:
+            logger.exception(
+                "recall chat reply failed session_id=%s mirako_session_id=%s recall_bot_id=%s chars=%s",
+                session.session_id,
+                session.mirako_session_id,
+                session.recall_bot_id,
+                len(text),
+            )
 
     async def _set_gateway_conversation_mode(self, session: Session, mode: str) -> None:
         async with httpx.AsyncClient(timeout=10) as client:

@@ -128,3 +128,32 @@ class RecallClient:
             data = response.json()
             logger.info("recall leave_call success bot_id=%s", bot_id)
             return data
+
+    async def send_chat_message(
+        self, bot_id: str, *, message: str, to: str = "everyone"
+    ) -> dict[str, Any] | None:
+        logger.info("recall send_chat_message start bot_id=%s to=%s", bot_id, to)
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                f"{self.base_url}/bot/{bot_id}/send_chat_message/",
+                headers={
+                    "Authorization": self.api_key,
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                },
+                json={"to": to, "message": message},
+            )
+            if response.status_code >= 400:
+                logger.error(
+                    "recall send_chat_message failed bot_id=%s status_code=%s response=%s",
+                    bot_id,
+                    response.status_code,
+                    response.text,
+                )
+            response.raise_for_status()
+            if not response.content:
+                logger.info("recall send_chat_message success bot_id=%s empty_response=true", bot_id)
+                return None
+            data = response.json()
+            logger.info("recall send_chat_message success bot_id=%s", bot_id)
+            return data

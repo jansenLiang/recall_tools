@@ -85,6 +85,18 @@ class Settings:
             "true",
             "yes",
         }
+        self.chat_agent_enabled = env("CHAT_AGENT_ENABLED", "true").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        self.hermes_agent_api_url = env(
+            "HERMES_AGENT_API_URL",
+            "http://42.193.249.228:8642/v1/chat/completions-lite",
+        )
+        self.hermes_agent_api_key = env("HERMES_AGENT_API_KEY")
+        self.hermes_agent_model = env("HERMES_AGENT_MODEL", "hermes-agent")
+        self.hermes_agent_timeout_seconds = env_int("HERMES_AGENT_TIMEOUT_SECONDS", 60)
 
         self.conversation_mode_policy = (
             env("CONVERSATION_MODE_POLICY", "auto").strip().lower()

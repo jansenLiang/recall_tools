@@ -80,11 +80,26 @@ class HermesAgentClient:
                             break
                         try:
                             data = json.loads(data_text)
-                            choice = data["choices"][0]
-                        except (KeyError, IndexError, TypeError, ValueError) as exc:
-                            raise HermesAgentError(
-                                None, "Hermes agent stream response missing choices[0]."
-                            ) from exc
+                        except ValueError:
+                            logger.debug(
+                                "skipping non-json hermes stream frame session_id=%s frame=%s",
+                                session_id,
+                                data_text[:200],
+                            )
+                            continue
+                        if not isinstance(data, dict):
+                            continue
+                        choices = data.get("choices")
+                        if not choices:
+                            logger.debug(
+                                "skipping non-openai hermes stream frame session_id=%s frame=%s",
+                                session_id,
+                                data_text[:200],
+                            )
+                            continue
+                        choice = choices[0]
+                        if not isinstance(choice, dict):
+                            continue
                         response_id = str(data.get("id") or response_id)
                         delta = choice.get("delta") or {}
                         content = delta.get("content")

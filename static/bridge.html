@@ -956,7 +956,7 @@
         setStatus(`WebRTC ${state.pc.connectionState}`);
         sendTelemetry("webrtc-connection-state", { connectionState: state.pc.connectionState });
         if (["failed", "disconnected"].includes(state.pc.connectionState)) {
-          scheduleReconnect();
+          scheduleReconnect("webrtc-connection-state", { connectionState: state.pc.connectionState });
         }
       };
       state.pc.oniceconnectionstatechange = () => {
@@ -1068,7 +1068,14 @@
         };
         ws.onclose = (event) => {
           sendTelemetry("gateway-ws-close", { code: event.code, reason: event.reason, wasClean: event.wasClean });
-          if (!state.cleaningUp) scheduleReconnect();
+          if (!state.cleaningUp) {
+            scheduleReconnect("gateway-ws-close", {
+              code: event.code,
+              reason: event.reason,
+              wasClean: event.wasClean,
+              readyState: ws.readyState,
+            });
+          }
         };
       });
 
@@ -1142,14 +1149,40 @@
       state.cleaningUp = false;
     }
 
-    function scheduleReconnect() {
-      if (state.stopped || state.terminalClosed) return;
+    function scheduleReconnect(reason = "unknown", details = {}) {
+      const snapshot = {
+        reason,
+        details,
+        stopped: state.stopped,
+        terminalClosed: state.terminalClosed,
+        cleaningUp: state.cleaningUp,
+        reconnectAttempts: state.reconnectAttempts,
+        gatewaySessionId: state.gatewaySessionId,
+        wsReadyState: state.ws ? state.ws.readyState : null,
+        pcConnectionState: state.pc ? state.pc.connectionState : null,
+        pcIceConnectionState: state.pc ? state.pc.iceConnectionState : null,
+        pcSignalingState: state.pc ? state.pc.signalingState : null,
+      };
+      sendTelemetry("bridge-reconnect-requested", snapshot);
+      if (state.stopped || state.terminalClosed) {
+        sendTelemetry("bridge-reconnect-skipped", snapshot);
+        return;
+      }
       state.reconnectAttempts += 1;
       if (state.reconnectAttempts > 5) {
+        sendTelemetry("bridge-reconnect-limit", {
+          ...snapshot,
+          reconnectAttempts: state.reconnectAttempts,
+        });
         setStatus("Bridge reconnect limit reached", true);
         return;
       }
       const delay = Math.min(10000, 1000 * state.reconnectAttempts);
+      sendTelemetry("bridge-reconnect-scheduled", {
+        ...snapshot,
+        reconnectAttempts: state.reconnectAttempts,
+        delayMs: delay,
+      });
       setStatus(`Bridge reconnecting in ${delay}ms`);
       cleanup();
       state.reconnectTimer = setTimeout(() => {

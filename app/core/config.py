@@ -35,6 +35,11 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
+def env_bool(name: str, default: bool) -> bool:
+    value = env(name, "true" if default else "false").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
 class Settings:
     def __init__(self) -> None:
         self.recall_api_key = env("RECALL_API_KEY")
@@ -123,7 +128,12 @@ class Settings:
         self.minimax_timeout_seconds = env_int("MINIMAX_TIMEOUT_SECONDS", 60)
         self.capture_prompt = env(
             "CAPTURE_PROMPT",
-            "Describe the current meeting screen or shared screen. Prioritize visible text, slide titles, bullet points, UI labels, charts, tables, code, and key data. Transcribe important on-screen text exactly when possible, then summarize the actionable meaning concisely. If no shared-screen content is visible, say so.",
+            "Summarize the image content from the current meeting screen or shared screen. Prioritize visible text, slide titles, bullet points, UI labels, charts, tables, code, and key data. Transcribe important on-screen text exactly when possible, then summarize the actionable meaning concisely. If no shared-screen content is visible, say so.",
+        )
+        self.capture_save_images = env_bool("CAPTURE_SAVE_IMAGES", True)
+        self.capture_image_dir = env("CAPTURE_IMAGE_DIR", "captures")
+        self.capture_log_description_chars = env_int(
+            "CAPTURE_LOG_DESCRIPTION_CHARS", 2000
         )
 
         self.zoom_oauth_client_id = env("ZOOM_OAUTH_CLIENT_ID")

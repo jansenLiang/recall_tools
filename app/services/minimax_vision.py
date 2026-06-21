@@ -44,7 +44,6 @@ class MinimaxVisionClient:
         if not image_bytes:
             raise MinimaxVisionError(400, "image_bytes is empty.")
         encoded = base64.b64encode(image_bytes).decode("ascii")
-        data_url = f"data:{mime_type};base64,{encoded}"
         payload = {
             "model": self.model,
             "messages": [
@@ -52,19 +51,26 @@ class MinimaxVisionClient:
                     "role": "user",
                     "content": [
                         {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": data_url}},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": mime_type,
+                                "data": encoded,
+                            },
+                        },
                     ],
                 }
             ],
             "max_tokens": 1024,
-            "temperature": 0.2,
+            "thinking": {"type": "adaptive"},
         }
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
-        url = f"{self.api_base}/chat/completions"
+        url = f"{self.api_base}/anthropic/v1/messages"
         logger.info(
             "minimax vision request model=%s mime=%s bytes=%s",
             self.model,
@@ -76,7 +82,9 @@ class MinimaxVisionClient:
                 response = await client.post(url, headers=headers, json=payload)
         except httpx.HTTPError as exc:
             logger.exception("minimax vision request failed")
-            raise MinimaxVisionError(502, {"error": "minimax_request_failed", "message": str(exc)}) from exc
+            raise MinimaxVisionError(
+                502, {"error": "minimax_request_failed", "message": str(exc)}
+            ) from exc
 
         if response.status_code >= 400:
             logger.error(
@@ -92,13 +100,19 @@ class MinimaxVisionClient:
         try:
             data = response.json()
         except ValueError as exc:
-            raise MinimaxVisionError(502, {"error": "minimax_invalid_response", "message": str(exc)}) from exc
+            raise MinimaxVisionError(
+                502, {"error": "minimax_invalid_response", "message": str(exc)}
+            ) from exc
 
-        choices = data.get("choices") or []
-        if not choices:
-            raise MinimaxVisionError(502, {"error": "minimax_no_choices", "body": data})
-        message = choices[0].get("message") or {}
-        content = message.get("content")
+        content = data.get("content")
+        if content is None:
+            choices = data.get("choices") or []
+            if not choices:
+                raise MinimaxVisionError(
+                    502, {"error": "minimax_no_content", "body": data}
+                )
+            message = choices[0].get("message") or {}
+            content = message.get("content")
         if isinstance(content, str):
             return content.strip()
         if isinstance(content, list):

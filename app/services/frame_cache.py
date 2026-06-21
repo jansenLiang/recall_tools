@@ -82,9 +82,12 @@ class H264FrameCache:
         self.max_participants = max(1, max_participants)
         self.max_age_seconds = max(1.0, float(max_age_seconds))
         self.max_bytes = max(1024 * 1024, max_bytes)
-        self._buckets: "OrderedDict[tuple[str, str], _BucketAccumulator]" = OrderedDict()
+        self._buckets: "OrderedDict[tuple[str, str], _BucketAccumulator]" = (
+            OrderedDict()
+        )
         self._lock = asyncio.Lock()
         self._total_bytes = 0
+        self._diagnostic_keys: set[tuple[str, str, str]] = set()
 
     @staticmethod
     def _decode_nal_payload(buffer_b64: str) -> bytes:
@@ -117,9 +120,31 @@ class H264FrameCache:
         buffer_b64: str,
     ) -> None:
         if not participant_id or frame_type not in {"webcam", "screenshare"}:
+            diagnostic_key = (
+                participant_id or "<missing>",
+                frame_type or "<missing>",
+                "invalid-frame-type",
+            )
+            if diagnostic_key not in self._diagnostic_keys:
+                self._diagnostic_keys.add(diagnostic_key)
+                logger.info(
+                    "frame cache h264 diagnostic: dropping chunk participant_id=%s frame_type=%s reason=invalid_frame_type buffer_b64_len=%s",
+                    participant_id,
+                    frame_type,
+                    len(buffer_b64 or ""),
+                )
             return
         chunk = self._decode_nal_payload(buffer_b64)
         if not chunk:
+            diagnostic_key = (participant_id, frame_type, "empty-buffer")
+            if diagnostic_key not in self._diagnostic_keys:
+                self._diagnostic_keys.add(diagnostic_key)
+                logger.info(
+                    "frame cache h264 diagnostic: dropping chunk participant_id=%s frame_type=%s reason=empty_decoded_buffer buffer_b64_len=%s",
+                    participant_id,
+                    frame_type,
+                    len(buffer_b64 or ""),
+                )
             return
         async with self._lock:
             bucket = self._buckets.get((participant_id, frame_type))
@@ -131,6 +156,40 @@ class H264FrameCache:
             self._buckets.move_to_end((participant_id, frame_type))
 
             nals = self._split_nals(chunk)
+            first_nal_type: int | None = None
+            if nals:
+                first_sclen, first_nal = nals[0]
+                if len(first_nal) > first_sclen:
+                    first_nal_type = _nal_unit_type(first_nal[first_sclen])
+            diagnostic_key = (participant_id, frame_type, "first-valid-chunk")
+            if diagnostic_key not in self._diagnostic_keys:
+                self._diagnostic_keys.add(diagnostic_key)
+                logger.info(
+                    "frame cache h264 diagnostic: chunk participant_id=%s frame_type=%s buffer_b64_len=%s decoded_bytes=%s starts_annexb4=%s starts_annexb3=%s nal_count=%s first_nal_type=%s has_sps=%s has_pps=%s",
+                    participant_id,
+                    frame_type,
+                    len(buffer_b64 or ""),
+                    len(chunk),
+                    chunk.startswith(H264_NAL_START_CODE_4),
+                    chunk.startswith(H264_NAL_START_CODE_3),
+                    len(nals),
+                    first_nal_type,
+                    bucket.sps is not None,
+                    bucket.pps is not None,
+                )
+            if not nals:
+                diagnostic_key = (participant_id, frame_type, "no-start-codes")
+                if diagnostic_key not in self._diagnostic_keys:
+                    self._diagnostic_keys.add(diagnostic_key)
+                    logger.info(
+                        "frame cache h264 diagnostic: dropping chunk participant_id=%s frame_type=%s reason=no_annexb_start_codes decoded_bytes=%s first_bytes_hex=%s",
+                        participant_id,
+                        frame_type,
+                        len(chunk),
+                        chunk[:8].hex(),
+                    )
+                return
+            idr_annexb = bytearray()
             for sclen, nal in nals:
                 if len(nal) <= sclen:
                     continue
@@ -144,10 +203,29 @@ class H264FrameCache:
                 if nal_type == H264_NAL_SEI:
                     continue
                 if nal_type == H264_NAL_IDR:
-                    bucket.idr_annexb = bytearray()
-                    bucket.idr_annexb.extend(nal)
-                    self._commit_idr(bucket, participant_id, frame_type)
-                    continue
+                    idr_annexb.extend(nal)
+            if idr_annexb:
+                bucket.idr_annexb = idr_annexb
+                self._commit_idr(bucket, participant_id, frame_type)
+                diagnostic_key = (participant_id, frame_type, "first-committed-idr")
+                if diagnostic_key not in self._diagnostic_keys:
+                    self._diagnostic_keys.add(diagnostic_key)
+                    logger.info(
+                        "frame cache h264 diagnostic: cached idr participant_id=%s frame_type=%s cached_bytes=%s idr_bytes=%s idr_nal_count=%s has_sps=%s has_pps=%s total_cache_bytes=%s",
+                        participant_id,
+                        frame_type,
+                        bucket.cached.size_bytes() if bucket.cached else 0,
+                        len(idr_annexb),
+                        sum(
+                            1
+                            for sclen, nal in nals
+                            if len(nal) > sclen
+                            and _nal_unit_type(nal[sclen]) == H264_NAL_IDR
+                        ),
+                        bucket.sps is not None,
+                        bucket.pps is not None,
+                        self._total_bytes,
+                    )
 
     def _commit_idr(
         self,
@@ -183,7 +261,10 @@ class H264FrameCache:
                 self._total_bytes -= bucket.cached.size_bytes()
 
     def _enforce_budget(self) -> None:
-        if self._total_bytes <= self.max_bytes and len(self._buckets) <= self.max_participants * 2:
+        if (
+            self._total_bytes <= self.max_bytes
+            and len(self._buckets) <= self.max_participants * 2
+        ):
             return
         self._evict_oldest()
 

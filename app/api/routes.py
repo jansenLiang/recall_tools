@@ -8,7 +8,16 @@ import logging
 import re
 import secrets
 
-from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Query, Request
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import HTMLResponse
 from fastapi.responses import FileResponse
 from fastapi.responses import PlainTextResponse
@@ -452,6 +461,56 @@ async def recall_bot_status_webhook(
     )
     background_tasks.add_task(session_service.handle_recall_bot_status, payload)
     return {"ok": True}
+
+
+@router.websocket("/api/recall/realtime/{session_id}")
+async def recall_realtime_websocket(
+    websocket: WebSocket,
+    session_id: str,
+    token: str | None = Query(default=None),
+) -> None:
+    if settings.service_api_key and not (
+        token and secrets.compare_digest(token, settings.service_api_key)
+    ):
+        await websocket.close(code=1008)
+        return
+    await websocket.accept()
+    logger.info("recall realtime websocket accepted session_id=%s", session_id)
+    messages = 0
+    h264_events = 0
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            messages += 1
+            try:
+                payload = json.loads(raw)
+            except ValueError:
+                logger.warning(
+                    "recall realtime websocket invalid json session_id=%s message=%s",
+                    session_id,
+                    raw[:500],
+                )
+                continue
+            try:
+                handled = await session_service.handle_recall_realtime_payload(
+                    session_id, payload
+                )
+            except Exception:
+                logger.exception(
+                    "recall realtime websocket payload failed session_id=%s event=%s",
+                    session_id,
+                    payload.get("event") if isinstance(payload, dict) else None,
+                )
+                continue
+            if handled:
+                h264_events += 1
+    except WebSocketDisconnect:
+        logger.info(
+            "recall realtime websocket disconnected session_id=%s messages=%s h264_events=%s",
+            session_id,
+            messages,
+            h264_events,
+        )
 
 
 @router.get(

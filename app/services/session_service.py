@@ -5,13 +5,14 @@ import io
 import logging
 import secrets
 import time
+from pathlib import Path
 from typing import Any
 
 import av
 import httpx
 
 from app.clients.recall import RecallClient
-from app.core.config import Settings, settings
+from app.core.config import ROOT, Settings, settings
 from app.models.session import Session
 from app.schemas.sessions import (
     CaptureScreenRequest,
@@ -30,7 +31,7 @@ from app.services.minimax_vision import (
     MinimaxVisionError,
     normalize_mime,
 )
-from app.services.recall_realtime import H264_EVENT, RecallRealtimeClient
+from app.services.recall_realtime import H264_EVENT
 from app.services.recall_store import recall_store
 
 
@@ -49,7 +50,7 @@ class SessionService:
         self.settings = app_settings
         self.sessions: dict[str, Session] = {}
         self._frame_caches: dict[str, H264FrameCache] = {}
-        self._realtime_clients: dict[str, RecallRealtimeClient] = {}
+        self._h264_diagnostic_keys: set[tuple[str, str, str, str]] = set()
 
     def get_session(self, session_id: str) -> Session | None:
         return self.sessions.get(session_id)
@@ -213,7 +214,7 @@ class SessionService:
             recall_bot_id=session.recall_bot_id,
             recall_bot=bot,
         )
-        await self._start_realtime_capture(session_id)
+        self._ensure_frame_cache(session_id)
         recall_store.add_event(
             event_type="bot.create",
             session_id=session_id,
@@ -417,6 +418,7 @@ class SessionService:
                 event == "participant_events.leave"
                 and session.meeting_participant_count == 0
             ):
+                self._mark_session_closed(session, reason="all_participants_left")
                 await self._best_effort_stop_gateway_session(
                     session, reason="all_participants_left"
                 )
@@ -724,6 +726,31 @@ class SessionService:
             png_bytes=png_bytes,
             prompt=req.prompt or self.settings.capture_prompt,
         )
+        captured_at = time.time()
+        frame_age_ms = int(max(0.0, (captured_at - cached.received_at) * 1000))
+        saved_image_path = self._save_capture_image(
+            session=session,
+            participant_id=target_pid or "",
+            frame_type=frame_type,
+            captured_at=captured_at,
+            png_bytes=png_bytes,
+        )
+        preview_chars = max(0, self.settings.capture_log_description_chars)
+        description_preview = description[:preview_chars] if preview_chars else ""
+        logger.info(
+            "capture_screen completed session_id=%s mirako_session_id=%s participant_id=%s frame_type=%s frame_age_ms=%s width=%s height=%s image_bytes=%s saved_image_path=%s description_chars=%s description_preview=%r",
+            session_id,
+            session.mirako_session_id,
+            target_pid,
+            frame_type,
+            frame_age_ms,
+            cached.width,
+            cached.height,
+            len(png_bytes),
+            saved_image_path,
+            len(description),
+            description_preview,
+        )
         return CaptureScreenResponse(
             session_id=session_id,
             mirako_session_id=session.mirako_session_id,
@@ -731,14 +758,48 @@ class SessionService:
             participant_name=participant_name,
             frame_type=frame_type,
             received_at=cached.received_at,
-            captured_at=time.time(),
-            frame_age_ms=int(max(0.0, (time.time() - cached.received_at) * 1000)),
+            captured_at=captured_at,
+            frame_age_ms=frame_age_ms,
             width=cached.width,
             height=cached.height,
             description=description,
             image_base64=(_b64encode(png_bytes) if req.include_image_base64 else None),
             mime_type="image/png",
         )
+
+    def _save_capture_image(
+        self,
+        *,
+        session: Session,
+        participant_id: str,
+        frame_type: str,
+        captured_at: float,
+        png_bytes: bytes,
+    ) -> str | None:
+        if not self.settings.capture_save_images:
+            return None
+        try:
+            capture_dir = Path(self.settings.capture_image_dir)
+            if not capture_dir.is_absolute():
+                capture_dir = ROOT / capture_dir
+            capture_dir.mkdir(parents=True, exist_ok=True)
+            timestamp_ms = int(captured_at * 1000)
+            safe_participant_id = "".join(
+                ch if ch.isalnum() or ch in {"-", "_"} else "_"
+                for ch in (participant_id or "unknown")
+            )
+            filename = f"{timestamp_ms}_{session.session_id}_{safe_participant_id}_{frame_type}.png"
+            path = capture_dir / filename
+            path.write_bytes(png_bytes)
+            return str(path)
+        except Exception:
+            logger.exception(
+                "capture_screen save image failed session_id=%s participant_id=%s frame_type=%s",
+                session.session_id,
+                participant_id,
+                frame_type,
+            )
+            return None
 
     def _normalize_public_base_url(self) -> str:
         base = self.settings.public_base_url.rstrip("/")
@@ -958,7 +1019,9 @@ class SessionService:
             self.settings.hermes_agent_model,
         )
         try:
-            async for chunk in client.chat(session_id=session.session_id, message=message):
+            async for chunk in client.chat(
+                session_id=session.session_id, message=message
+            ):
                 chunks.append(chunk)
         except HermesAgentError as exc:
             logger.error(
@@ -1070,8 +1133,25 @@ class SessionService:
         if self.settings.recall_video_separate_h264_enabled:
             config["video_separate_h264"] = {}
             config["video_mixed_layout"] = self.settings.recall_video_mixed_layout
+            ws_base_url = public_base_url.replace("https://", "wss://", 1).replace(
+                "http://", "ws://", 1
+            )
+            realtime_url = f"{ws_base_url}/api/recall/realtime/{session_id}"
+            if self.settings.service_api_key:
+                realtime_url = f"{realtime_url}?token={self.settings.service_api_key}"
+            config["realtime_endpoints"].append(
+                {
+                    "type": "websocket",
+                    "url": realtime_url,
+                    "events": [H264_EVENT],
+                    "metadata": {
+                        "session_id": session_id,
+                        "mirako_session_id": req.mirako_session_id,
+                    },
+                }
+            )
         logger.info(
-            "recall recording config built session_id=%s transcript_mode=%s transcript_language_code=%s transcript_webhook_events=%s participant_webhook_events=%s video_separate_h264=%s video_mixed_layout=%s",
+            "recall recording config built session_id=%s transcript_mode=%s transcript_language_code=%s transcript_webhook_events=%s participant_webhook_events=%s video_separate_h264=%s video_mixed_layout=%s realtime_websocket=%s",
             session_id,
             self.settings.recall_transcript_mode,
             self.settings.recall_transcript_language_code,
@@ -1079,6 +1159,7 @@ class SessionService:
             participant_events,
             self.settings.recall_video_separate_h264_enabled,
             config.get("video_mixed_layout"),
+            bool(self.settings.recall_video_separate_h264_enabled),
         )
         return config
 
@@ -1109,12 +1190,12 @@ class SessionService:
             )
         return {"zak_url": f"{public_base_url}/api/zoom/zak?secret={secret}"}
 
-    async def _start_realtime_capture(self, session_id: str) -> None:
+    def _ensure_frame_cache(self, session_id: str) -> H264FrameCache | None:
         if not self.settings.recall_video_separate_h264_enabled:
-            return
+            return None
         session = self.sessions.get(session_id)
-        if session is None or not session.recall_bot_id:
-            return
+        if session is None:
+            return None
         cache = self._frame_caches.get(session_id)
         if cache is None:
             cache = H264FrameCache(
@@ -1123,36 +1204,68 @@ class SessionService:
                 max_bytes=self.settings.frame_cache_max_bytes,
             )
             self._frame_caches[session_id] = cache
-        if (
-            session_id in self._realtime_clients
-            and self._realtime_clients[session_id].is_running()
-        ):
-            return
-        client = RecallRealtimeClient(
-            ws_url=self.settings.recall_realtime_ws_url,
-            api_key=self.settings.recall_api_key,
-            bot_id=session.recall_bot_id,
-            events=[H264_EVENT],
-            on_event=self._build_h264_handler(session_id, cache),
-        )
-        self._realtime_clients[session_id] = client
-        client.start()
-        logger.info(
-            "recall realtime capture started session_id=%s bot_id=%s ws_url=%s",
-            session_id,
-            session.recall_bot_id,
-            self.settings.recall_realtime_ws_url,
-        )
+            logger.info("recall realtime frame cache ready session_id=%s", session_id)
+        return cache
+
+    async def handle_recall_realtime_payload(
+        self, session_id: str, payload: dict[str, Any]
+    ) -> bool:
+        session = self.sessions.get(session_id)
+        if session is None:
+            logger.warning(
+                "recall realtime websocket unknown session_id=%s payload_event=%s",
+                session_id,
+                payload.get("event"),
+            )
+            return False
+        if session.closed:
+            logger.info(
+                "recall realtime websocket ignored closed session_id=%s reason=%s",
+                session_id,
+                session.closed_reason,
+            )
+            return False
+        cache = self._ensure_frame_cache(session_id)
+        if cache is None:
+            return False
+        event = str(payload.get("event") or "")
+        envelope = payload.get("data") or {}
+        if not isinstance(envelope, dict):
+            return False
+        data = self._extract_recall_realtime_data(envelope)
+        if event == H264_EVENT:
+            frame_type = str(data.get("type") or "")
+            buffer_b64 = str(data.get("buffer") or "")
+            participant = data.get("participant") or {}
+            pid = participant.get("id") if isinstance(participant, dict) else None
+            diagnostic_key = (session_id, event, frame_type, str(pid or ""))
+            if diagnostic_key not in self._h264_diagnostic_keys:
+                self._h264_diagnostic_keys.add(diagnostic_key)
+                logger.info(
+                    "recall realtime h264 diagnostic session_id=%s event=%s data_type=%s participant_id=%s participant_keys=%s buffer_b64_len=%s envelope_keys=%s data_keys=%s video_separate_keys=%s",
+                    session_id,
+                    event,
+                    frame_type,
+                    pid,
+                    sorted(participant.keys()) if isinstance(participant, dict) else [],
+                    len(buffer_b64),
+                    sorted(envelope.keys()),
+                    sorted(data.keys()),
+                    sorted((envelope.get("video_separate") or {}).keys())
+                    if isinstance(envelope.get("video_separate"), dict)
+                    else [],
+                )
+        await self._build_h264_handler(session_id, cache)(event, data)
+        return event == H264_EVENT
+
+    @staticmethod
+    def _extract_recall_realtime_data(envelope: dict[str, Any]) -> dict[str, Any]:
+        nested_data = envelope.get("data")
+        if isinstance(nested_data, dict):
+            return nested_data
+        return envelope
 
     async def _stop_realtime_capture(self, session_id: str) -> None:
-        client = self._realtime_clients.pop(session_id, None)
-        if client is not None:
-            try:
-                await client.stop()
-            except Exception:
-                logger.exception(
-                    "recall realtime capture stop failed session_id=%s", session_id
-                )
         cache = self._frame_caches.pop(session_id, None)
         if cache is not None:
             try:
@@ -1202,7 +1315,13 @@ class SessionService:
 
     async def _describe_with_minimax(self, *, png_bytes: bytes, prompt: str) -> str:
         if not self.settings.minimax_api_key:
-            return ""
+            raise SessionServiceError(
+                500,
+                {
+                    "error": "minimax_api_key_required",
+                    "message": "MINIMAX_API_KEY is required for capture_screen image understanding.",
+                },
+            )
         client = MinimaxVisionClient(
             api_base=self.settings.minimax_api_base,
             api_key=self.settings.minimax_api_key,

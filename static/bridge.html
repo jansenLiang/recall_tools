@@ -69,6 +69,35 @@
     .status.error {
       background: rgba(127, 29, 29, 0.82);
     }
+
+    .subtitle-overlay {
+      position: fixed;
+      left: 50%;
+      bottom: 42px;
+      transform: translateX(-50%);
+      width: min(88vw, 820px);
+      padding: 8px 12px;
+      border-radius: 8px;
+      background: rgba(0, 0, 0, 0.68);
+      color: #fff;
+      font-size: clamp(14px, 1.45vw, 18px);
+      line-height: 1.35;
+      font-weight: 600;
+      text-align: center;
+      text-shadow: 0 2px 6px rgba(0, 0, 0, 0.9);
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 120ms ease;
+      z-index: 2;
+    }
+
+    .subtitle-overlay.visible {
+      opacity: 1;
+    }
+
+    body.audio-only .subtitle-overlay {
+      bottom: 72px;
+    }
   </style>
 </head>
 
@@ -77,6 +106,7 @@
     <div class="fallback" id="fallback">Connecting Mirako</div>
     <video id="remote-video" autoplay playsinline></video>
     <audio id="remote-audio" autoplay></audio>
+    <div class="subtitle-overlay" id="subtitle-overlay" aria-live="polite"></div>
   </main>
   <div class="status" id="status">Starting bridge</div>
 
@@ -90,6 +120,7 @@
     const fallbackEl = document.getElementById("fallback");
     const remoteVideo = document.getElementById("remote-video");
     const remoteAudio = document.getElementById("remote-audio");
+    const subtitleOverlay = document.getElementById("subtitle-overlay");
 
     if (config.mode === "audio") {
       document.body.classList.add("audio-only");
@@ -134,6 +165,10 @@
       reconnectAttempts: 0,
       reconnectTimer: null,
       speechWatchdogTimer: null,
+      currentSubtitleSessionTs: null,
+      subtitleText: "",
+      pendingSubtitleText: "",
+      subtitleClearTimer: null,
       cleaningUp: false,
       stopped: false,
       terminalClosed: Boolean(config.closed),
@@ -152,6 +187,77 @@
       statusEl.classList.add("error");
       fallbackEl.textContent = "Service unavailable";
       sendTelemetry("service-error", { message, error: safeError(error) });
+    }
+
+    function setSubtitle(text) {
+      subtitleOverlay.textContent = text || "";
+      subtitleOverlay.classList.toggle("visible", Boolean(text));
+    }
+
+    function clearSubtitleTimer() {
+      if (state.subtitleClearTimer) {
+        clearTimeout(state.subtitleClearTimer);
+        state.subtitleClearTimer = null;
+      }
+    }
+
+    function resetSubtitles() {
+      clearSubtitleTimer();
+      state.currentSubtitleSessionTs = null;
+      state.subtitleText = "";
+      state.pendingSubtitleText = "";
+      setSubtitle("");
+    }
+
+    function appendSubtitleText(current, incoming) {
+      if (!current) return incoming;
+      if (/^[,.;:!?，。！？；：、]/.test(incoming)) return current + incoming;
+      return `${current} ${incoming}`;
+    }
+
+    function remoteMediaIsPlaying() {
+      const activeAudio = !remoteAudio.paused && !remoteAudio.ended && remoteAudio.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA;
+      const activeVideo = !remoteVideo.paused && !remoteVideo.ended && remoteVideo.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA;
+      return config.mode === "audio" ? activeAudio : activeAudio || activeVideo;
+    }
+
+    function flushPendingSubtitle() {
+      if (!state.pendingSubtitleText) return;
+      clearSubtitleTimer();
+      state.subtitleText = appendSubtitleText(state.subtitleText, state.pendingSubtitleText);
+      state.pendingSubtitleText = "";
+      setSubtitle(state.subtitleText);
+      sendTelemetry("subtitle-shown", { source: "media-playing", session_ts: state.currentSubtitleSessionTs });
+    }
+
+    function handleCueChunk(message) {
+      const payload = message.payload || message;
+      const text = (payload.text || "").trim();
+      const sessionTs = payload.ts ?? message.session_ts ?? null;
+      if (!text) return;
+
+      if (sessionTs !== null && state.currentSubtitleSessionTs !== sessionTs) {
+        resetSubtitles();
+        state.currentSubtitleSessionTs = sessionTs;
+      }
+
+      clearSubtitleTimer();
+      if (remoteMediaIsPlaying()) {
+        state.subtitleText = appendSubtitleText(state.subtitleText, text);
+        setSubtitle(state.subtitleText);
+        sendTelemetry("subtitle-shown", { source: "cue", session_ts: sessionTs, text });
+      } else {
+        state.pendingSubtitleText = appendSubtitleText(state.pendingSubtitleText, text);
+        sendTelemetry("subtitle-pending", { session_ts: sessionTs, text });
+      }
+    }
+
+    function handleStreamEnd(message) {
+      const sessionTs = message.session_ts ?? message.payload?.ts ?? null;
+      if (sessionTs === null || sessionTs === state.currentSubtitleSessionTs) {
+        clearSubtitleTimer();
+        state.subtitleClearTimer = setTimeout(resetSubtitles, 1800);
+      }
     }
 
     function safeError(error) {
@@ -189,10 +295,10 @@
     }
 
     function playNotificationAudio(url) {
-      state.vadStartSuppressUntil = Math.max(state.vadStartSuppressUntil, Date.now() + 1200);
+      state.vadStartSuppressUntil = Math.max(state.vadStartSuppressUntil, Date.now() + vadGate.notificationSuppressMs);
       const audio = new Audio(url && !url.startsWith("/audio/") ? url : "/static/dd.mp3");
       audio.addEventListener("ended", () => {
-        state.vadStartSuppressUntil = Math.max(state.vadStartSuppressUntil, Date.now() + 300);
+        state.vadStartSuppressUntil = Math.max(state.vadStartSuppressUntil, Date.now() + vadGate.notificationTailSuppressMs);
       });
       audio.play().catch((error) => {
         sendTelemetry("notification-audio-failed", { error: safeError(error) });
@@ -318,7 +424,8 @@
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
-          autoGainControl: true,
+          autoGainControl: false,
+          latency: 0,
           sampleRate: 48000,
           channelCount: 1,
         },
@@ -377,12 +484,15 @@
       endHangoverMs: 650,
       minStartRms: 0.015,
       minStartPeak: 0.07,
-      minRestartGapMs: 250,
+      minRestartGapMs: 1200,
+      postEndSuppressMs: 1200,
+      notificationSuppressMs: 1200,
+      notificationTailSuppressMs: 300,
       positiveSpeechThreshold: 0.45,
       negativeSpeechThreshold: 0.30,
-      redemptionMs: 700,
+      redemptionMs: 1200,
       uploadChunkSamples: 1600,
-      preSpeechSamples: 8000,
+      preSpeechSamples: 12000,
       endTailFlushMs: 120,
       watchdogMs: 15000,
     };
@@ -701,6 +811,10 @@
         state.speakingSeq = null;
         state.speakingStartedAt = 0;
         state.lastVadEndAt = vadGate.lastAcceptedEndAt;
+        state.vadStartSuppressUntil = Math.max(
+          state.vadStartSuppressUntil,
+          vadGate.lastAcceptedEndAt + vadGate.postEndSuppressMs
+        );
         sendTelemetry("vad-speaking", {
           speaking: false,
           vadMode: state.vadMode,
@@ -1059,6 +1173,19 @@
           if (["wakeword-start", "wakeword-stop", "conversation-mode-changed"].includes(message.type)) {
             playNotificationAudio(message.notificationAudioUrl);
             sendTelemetry("notification-audio", { type: message.type });
+            if (message.type === "wakeword-stop") resetSubtitles();
+            return;
+          }
+          if (message.type === "cue_chunk") {
+            handleCueChunk(message);
+            return;
+          }
+          if (message.type === "stream_end") {
+            handleStreamEnd(message);
+            return;
+          }
+          if (message.type === "backend-disconnected") {
+            resetSubtitles();
           }
         };
 
@@ -1069,6 +1196,7 @@
         ws.onclose = (event) => {
           sendTelemetry("gateway-ws-close", { code: event.code, reason: event.reason, wasClean: event.wasClean });
           if (!state.cleaningUp) {
+            resetSubtitles();
             scheduleReconnect("gateway-ws-close", {
               code: event.code,
               reason: event.reason,
@@ -1104,6 +1232,7 @@
       if (state.vad && state.vad.audioContext) void state.vad.audioContext.close();
       if (state.vadAudioContext) void state.vadAudioContext.close();
       if (state.vadEndFlushTimer) clearTimeout(state.vadEndFlushTimer);
+      resetSubtitles();
       stopPcmUploader();
       if (state.ws) {
         state.ws.onclose = null;
@@ -1135,6 +1264,9 @@
       state.vadPendingStart = null;
       state.speakingStartedAt = 0;
       state.speakingSeq = null;
+      state.currentSubtitleSessionTs = null;
+      state.subtitleText = "";
+      state.pendingSubtitleText = "";
       state.lastVadEndAt = 0;
       state.vadStartSuppressUntil = 0;
       vadGate.active = false;
@@ -1239,6 +1371,12 @@
     remoteVideo.addEventListener("loadeddata", () => sendTelemetry("video-loadeddata", { media: collectMediaElementState() }));
     remoteVideo.addEventListener("canplay", () => sendTelemetry("video-canplay", { media: collectMediaElementState() }));
     remoteVideo.addEventListener("playing", () => sendTelemetry("video-playing", { media: collectMediaElementState() }));
+    remoteVideo.addEventListener("playing", flushPendingSubtitle);
+    remoteVideo.addEventListener("play", flushPendingSubtitle);
+    remoteVideo.addEventListener("ended", () => {
+      clearSubtitleTimer();
+      state.subtitleClearTimer = setTimeout(resetSubtitles, 1200);
+    });
     remoteVideo.addEventListener("waiting", () => sendTelemetry("video-waiting", { media: collectMediaElementState() }));
     remoteVideo.addEventListener("stalled", () => sendTelemetry("video-stalled", { media: collectMediaElementState() }));
     remoteVideo.addEventListener("resize", () => sendTelemetry("video-resize", { media: collectMediaElementState() }));
@@ -1248,6 +1386,22 @@
         error: error ? { code: error.code, message: error.message } : null,
         media: collectMediaElementState(),
       });
+    });
+
+    remoteAudio.addEventListener("playing", () => sendTelemetry("audio-playing", { media: collectMediaElementState() }));
+    remoteAudio.addEventListener("playing", flushPendingSubtitle);
+    remoteAudio.addEventListener("play", flushPendingSubtitle);
+    remoteAudio.addEventListener("ended", () => {
+      clearSubtitleTimer();
+      state.subtitleClearTimer = setTimeout(resetSubtitles, 1200);
+    });
+    remoteAudio.addEventListener("error", () => {
+      const error = remoteAudio.error;
+      sendTelemetry("audio-element-error", {
+        error: error ? { code: error.code, message: error.message } : null,
+        media: collectMediaElementState(),
+      });
+      resetSubtitles();
     });
 
     start().catch((error) => showServiceError(error));
